@@ -1,0 +1,51 @@
+{
+  "name": "scuba",
+  "version": "0.1.0",
+  "description": "Spawn terminals in any folder from your browser.",
+  "type": "module",
+  "bin": {
+    "scuba": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "web-dist",
+    "scripts",
+    "README.md"
+  ],
+  "scripts": {
+    "dev:server": "tsx watch src/cli.ts start --dev",
+    "dev:web": "vite --config web/vite.config.ts",
+    "dev": "concurrently -n server,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "build:server": "tsc -p tsconfig.json",
+    "build:web": "vite build --config web/vite.config.ts",
+    "build": "npm run build:server && npm run build:web",
+    "start": "node dist/cli.js start",
+    "prepublishOnly": "npm run build",
+    "postinstall": "node scripts/fix-pty-perms.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "node-pty": "^1.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "@types/ws": "^8.5.13",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0",
+    "@xterm/xterm": "^5.5.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-web-links": "^0.11.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
