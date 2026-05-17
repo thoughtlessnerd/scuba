@@ -86,6 +86,17 @@ export async function startServer(opts: ServerOptions): Promise<http.Server> {
     console.log('[agent] MOTHER_TELEGRAM_CHAT_ID not set — mother disabled');
   }
 
+  // Adhoc claude terminals are bound to a chat at spawn time. Any user message
+  // arriving in that chat (other than mother's chat, which is sacred) is
+  // enqueued into every adhoc terminal bound to it.
+  telegram.on('message', (m: TelegramMessage) => {
+    if (m.from !== 'user') return;
+    if (motherChatId && m.chatId === motherChatId) return;
+    const text = (m.text ?? '').trim();
+    if (!text) return;
+    agents.enqueueForAdhocChat(m.chatId, text);
+  });
+
   app.get('/api/sessions', (_req, res) => {
     res.json(mgr.listSessions());
   });
@@ -282,6 +293,16 @@ export async function startServer(opts: ServerOptions): Promise<http.Server> {
     }
   });
 
+  app.get('/api/agent/bound-chats', (_req, res) => {
+    // chatIds in use by any live agent terminal (mother, worker, adhoc).
+    // Used by the New-claude modal to hide already-bound chats from the picker.
+    const bound = new Set<string>();
+    for (const t of agents.listTerminals()) {
+      if (t.record.chatId) bound.add(t.record.chatId);
+    }
+    res.json({ chatIds: Array.from(bound) });
+  });
+
   app.get('/api/agent/terminals', (req, res) => {
     const groupId = typeof req.query.groupId === 'string' ? req.query.groupId : undefined;
     const list = agents.listTerminals();
@@ -363,6 +384,25 @@ export async function startServer(opts: ServerOptions): Promise<http.Server> {
         cwd,
         chatId: motherChatId,
         systemPrompt: MOTHER_SYSTEM_PROMPT,
+      });
+      res.json({ ...t.record, state: t.detector.getState() });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/agent/adhoc', (req, res) => {
+    try {
+      const { cwd, chatId, name } = req.body ?? {};
+      if (typeof cwd !== 'string' || !cwd.trim()) throw new Error('cwd required');
+      if (typeof chatId !== 'string' || !chatId.trim()) throw new Error('chatId required');
+      if (motherChatId && chatId.trim() === motherChatId) {
+        throw new Error("can't bind adhoc claude to mother's chat");
+      }
+      const t = agents.spawnAdhoc({
+        cwd: cwd.trim(),
+        chatId: chatId.trim(),
+        name: typeof name === 'string' ? name : undefined,
       });
       res.json({ ...t.record, state: t.detector.getState() });
     } catch (err) {

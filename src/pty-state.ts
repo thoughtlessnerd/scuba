@@ -17,6 +17,16 @@ export interface AwaitingChoiceInfo {
   rawTail: string;
 }
 
+/** A run of consecutive cells on a row sharing the same visual style. */
+export interface ScreenRun {
+  text: string;
+  fg: string | null;   // hex like '#aabbcc', or null = default
+  bg: string | null;
+  bold: boolean;
+}
+
+export type ColoredScreen = ScreenRun[][];
+
 export interface StateTransitionEvent {
   from: PtyState;
   to: PtyState;
@@ -81,6 +91,25 @@ export class PtyStateDetector extends EventEmitter {
   /** Visible screen as plain text — the "screenshot" payload for Telegram. */
   getScreen(): string {
     return this.readVisibleScreen().join('\n').replace(/\n+$/g, '');
+  }
+
+  /**
+   * Visible screen with per-cell color/bold attributes, batched into runs.
+   * Used by the colored PNG renderer. Trailing all-empty rows are stripped.
+   */
+  getColoredScreen(): ColoredScreen {
+    const buf = this.term.buffer.active;
+    const startY = buf.viewportY;
+    const endY = startY + this.term.rows;
+    const rows: ColoredScreen = [];
+    for (let y = startY; y < endY; y++) {
+      const line = buf.getLine(y);
+      if (!line) { rows.push([]); continue; }
+      rows.push(extractRuns(line, this.term.cols));
+    }
+    // Drop trailing blank rows so the image isn't mostly empty.
+    while (rows.length > 0 && rowIsBlank(rows[rows.length - 1])) rows.pop();
+    return rows;
   }
 
   /** Last N non-empty visible lines (post-trim). */
@@ -158,6 +187,107 @@ export class PtyStateDetector extends EventEmitter {
     const evt: StateTransitionEvent = { from: prev, to: next, awaiting: this.currentAwaiting };
     this.emit('transition', evt);
   }
+}
+
+/**
+ * 256-color xterm palette. Index 0-15 are the standard ANSI colors (using the
+ * common xterm defaults); 16-231 form a 6x6x6 color cube; 232-255 are a
+ * grayscale ramp. Computed once.
+ */
+const PALETTE_256: string[] = (() => {
+  const hex = (n: number) => n.toString(16).padStart(2, '0');
+  const arr: string[] = [
+    '#000000', '#cd0000', '#00cd00', '#cdcd00', '#0000ee', '#cd00cd', '#00cdcd', '#e5e5e5',
+    '#7f7f7f', '#ff0000', '#00ff00', '#ffff00', '#5c5cff', '#ff00ff', '#00ffff', '#ffffff',
+  ];
+  const levels = [0, 95, 135, 175, 215, 255];
+  for (let r = 0; r < 6; r++) {
+    for (let g = 0; g < 6; g++) {
+      for (let b = 0; b < 6; b++) {
+        arr.push(`#${hex(levels[r])}${hex(levels[g])}${hex(levels[b])}`);
+      }
+    }
+  }
+  for (let i = 0; i < 24; i++) {
+    const v = 8 + i * 10;
+    arr.push(`#${hex(v)}${hex(v)}${hex(v)}`);
+  }
+  return arr;
+})();
+
+function colorFromCell(
+  isDefault: () => boolean,
+  isRGB: () => boolean,
+  isPalette: () => boolean,
+  getColor: () => number,
+): string | null {
+  if (isDefault()) return null;
+  const c = getColor();
+  if (isRGB()) {
+    const hex = (n: number) => n.toString(16).padStart(2, '0');
+    return `#${hex((c >>> 16) & 0xff)}${hex((c >>> 8) & 0xff)}${hex(c & 0xff)}`;
+  }
+  if (isPalette()) {
+    return PALETTE_256[c] ?? null;
+  }
+  return null;
+}
+
+function extractRuns(line: import('@xterm/headless').IBufferLine, cols: number): ScreenRun[] {
+  const runs: ScreenRun[] = [];
+  let current: ScreenRun | null = null;
+  let trailingSpaces = 0;
+  for (let x = 0; x < cols; x++) {
+    const cell = line.getCell(x);
+    if (!cell) continue;
+    const w = cell.getWidth();
+    if (w === 0) continue; // skip combining mark cells (handled by previous wide char)
+    const chars = cell.getChars() || ' ';
+    const fg = colorFromCell(
+      () => Boolean(cell.isFgDefault()),
+      () => Boolean(cell.isFgRGB()),
+      () => Boolean(cell.isFgPalette()),
+      () => cell.getFgColor(),
+    );
+    const bg = colorFromCell(
+      () => Boolean(cell.isBgDefault()),
+      () => Boolean(cell.isBgRGB()),
+      () => Boolean(cell.isBgPalette()),
+      () => cell.getBgColor(),
+    );
+    const bold = Boolean(cell.isBold());
+    const inverse = Boolean(cell.isInverse());
+    const effFg = inverse ? (bg ?? '#000000') : fg;
+    const effBg = inverse ? (fg ?? '#d8dee9') : bg;
+
+    if (
+      !current ||
+      current.fg !== effFg ||
+      current.bg !== effBg ||
+      current.bold !== bold
+    ) {
+      current = { text: '', fg: effFg, bg: effBg, bold };
+      runs.push(current);
+    }
+    current.text += chars;
+    if (chars.trim() === '' && effBg === null) trailingSpaces += chars.length;
+    else trailingSpaces = 0;
+  }
+  // Trim trailing whitespace runs (with no bg) so SVG doesn't waste width.
+  if (trailingSpaces > 0 && runs.length > 0) {
+    const last = runs[runs.length - 1];
+    last.text = last.text.replace(/\s+$/, '');
+    if (last.text.length === 0) runs.pop();
+  }
+  return runs;
+}
+
+function rowIsBlank(runs: ScreenRun[]): boolean {
+  for (const r of runs) {
+    if (r.text.trim().length > 0) return false;
+    if (r.bg !== null) return false;
+  }
+  return true;
 }
 
 const BARE_PROMPT_RE = /^[│|\s]*[>❯][\s_▏▎▍▌▋▊▉█]*$/;

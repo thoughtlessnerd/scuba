@@ -1,9 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import type { GroupInfo, GroupType, SessionInfo } from '../types';
 import { TerminalPane } from './TerminalPane';
 import { EditableLabel } from './EditableLabel';
 import { sessionLabel } from '../labels';
-import * as api from '../api';
 
 interface Props {
   sessions: SessionInfo[];
@@ -13,7 +12,6 @@ interface Props {
   activeSessionId: string | null;
   onSelect: (id: string) => void;
   onRenameSession: (id: string, name: string) => void;
-  onMotherSpawned: () => void;
 }
 
 interface GroupBucket {
@@ -52,7 +50,14 @@ export function Workspace(props: Props) {
   if (totalSessions === 0) {
     return (
       <main className="workspace">
-        <MotherSpawnPanel onSpawned={props.onMotherSpawned} />
+        <div className="empty empty-hero">
+          <div className="empty-title">Welcome to scuba.</div>
+          <div className="empty-sub">
+            Spawn a <strong>New terminal</strong> for a plain shell, a <strong>New claude</strong>
+            {' '}for an isolated claude session bound to a Telegram chat, or click
+            {' '}<strong>Spawn mother</strong> in the header to start the orchestration layer.
+          </div>
+        </div>
       </main>
     );
   }
@@ -70,58 +75,6 @@ export function Workspace(props: Props) {
         />
       ))}
     </main>
-  );
-}
-
-function MotherSpawnPanel({ onSpawned }: { onSpawned: () => void }) {
-  const [status, setStatus] = useState<api.MotherStatus | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    api.getMotherStatus().then(setStatus).catch(() => {});
-  }, []);
-
-  const onSpawn = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await api.spawnMother();
-      const next = await api.getMotherStatus();
-      setStatus(next);
-      onSpawned();
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  if (!status) return <div className="empty">…</div>;
-
-  if (!status.configured) {
-    return (
-      <div className="mother-cta">
-        <div className="mother-cta-title">Mother is not configured</div>
-        <div className="mother-cta-sub">Set <code>MOTHER_TELEGRAM_CHAT_ID</code> in <code>.env</code> and restart scuba.</div>
-      </div>
-    );
-  }
-
-  if (status.alive) {
-    return <div className="empty">Spawn a terminal to get started.</div>;
-  }
-
-  return (
-    <div className="mother-cta">
-      <button className="mother-spawn-btn" onClick={onSpawn} disabled={busy}>
-        {busy ? 'spawning…' : 'Spawn mother claude'}
-      </button>
-      <div className="mother-cta-sub">
-        Mother listens on your configured Telegram chat and orchestrates worker terminals.
-      </div>
-      {error && <div className="mother-cta-error">{error}</div>}
-    </div>
   );
 }
 

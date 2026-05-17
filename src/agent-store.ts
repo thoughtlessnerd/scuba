@@ -3,7 +3,7 @@ import os from 'node:os';
 import { mkdirSync } from 'node:fs';
 import Database from 'better-sqlite3';
 
-export type AgentRole = 'mother' | 'worker';
+export type AgentRole = 'mother' | 'worker' | 'adhoc';
 
 export interface AgentTerminalRecord {
   id: string;
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS terminals (
   group_id            TEXT,
   chat_id             TEXT,
   system_prompt       TEXT NOT NULL,
-  role                TEXT NOT NULL CHECK(role IN ('mother','worker')),
+  role                TEXT NOT NULL,
   created_at          INTEGER NOT NULL
 );
 
@@ -91,6 +91,98 @@ export class AgentStore {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /**
+   * Pre-existing DBs were created with `CHECK(role IN ('mother','worker'))`.
+   * Adding 'adhoc' would be rejected, so rebuild the table when we detect
+   * the old constraint. Idempotent.
+   *
+   * SQLite recipe: temporarily disable foreign keys, build the new table,
+   * copy rows, drop the old, rename. We can't ALTER TABLE RENAME first because
+   * that rewrites referencing FKs in `pending_prompts` to point at the
+   * renamed (then-dropped) name, leaving them dangling.
+   *
+   * Also self-heals a previous botched migration that left `terminals_old`
+   * around or `pending_prompts` referencing it.
+   */
+  private migrate(): void {
+    const row = this.db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='terminals'",
+    ).get() as { sql: string } | undefined;
+    const hasOld = this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='terminals_old'",
+    ).get() as { name: string } | undefined;
+    const promptsRow = this.db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='pending_prompts'",
+    ).get() as { sql: string } | undefined;
+    const promptsBroken = promptsRow?.sql.includes('terminals_old');
+
+    const needsTerminalsRebuild = row?.sql.includes('CHECK');
+    if (!needsTerminalsRebuild && !hasOld && !promptsBroken) return;
+
+    this.db.pragma('foreign_keys = OFF');
+    try {
+      this.db.exec(`
+        BEGIN;
+
+        -- Restore terminals from a stray rename, if any.
+        ${hasOld && !needsTerminalsRebuild ? 'DROP TABLE IF EXISTS terminals_old;' : ''}
+
+        -- Rebuild terminals without the CHECK constraint.
+        CREATE TABLE IF NOT EXISTS terminals_new (
+          id                  TEXT PRIMARY KEY,
+          claude_session_id   TEXT NOT NULL UNIQUE,
+          cwd                 TEXT NOT NULL,
+          name                TEXT NOT NULL,
+          group_id            TEXT,
+          chat_id             TEXT,
+          system_prompt       TEXT NOT NULL,
+          role                TEXT NOT NULL,
+          created_at          INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO terminals_new
+          SELECT * FROM terminals;
+        ${hasOld ? 'INSERT OR IGNORE INTO terminals_new SELECT * FROM terminals_old;' : ''}
+        DROP TABLE terminals;
+        ${hasOld ? 'DROP TABLE IF EXISTS terminals_old;' : ''}
+        ALTER TABLE terminals_new RENAME TO terminals;
+
+        -- Rebuild pending_prompts if its FK references a stale name.
+        ${promptsBroken ? `
+        CREATE TABLE pending_prompts_new (
+          id                  TEXT PRIMARY KEY,
+          terminal_id         TEXT NOT NULL,
+          chat_id             TEXT NOT NULL,
+          telegram_message_id INTEGER NOT NULL,
+          question            TEXT NOT NULL,
+          options_json        TEXT NOT NULL,
+          created_at          INTEGER NOT NULL,
+          FOREIGN KEY (terminal_id) REFERENCES terminals(id) ON DELETE CASCADE
+        );
+        INSERT INTO pending_prompts_new SELECT * FROM pending_prompts;
+        DROP TABLE pending_prompts;
+        ALTER TABLE pending_prompts_new RENAME TO pending_prompts;
+        ` : ''}
+
+        -- Cascade deletes never fired while the FK pointed at a dropped
+        -- table, so manually clear orphaned prompts.
+        DELETE FROM pending_prompts
+          WHERE terminal_id NOT IN (SELECT id FROM terminals);
+
+        CREATE INDEX IF NOT EXISTS idx_terminals_role ON terminals(role);
+        CREATE INDEX IF NOT EXISTS idx_terminals_group ON terminals(group_id);
+        CREATE INDEX IF NOT EXISTS idx_pending_terminal ON pending_prompts(terminal_id);
+        COMMIT;
+      `);
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    } finally {
+      this.db.pragma('foreign_keys = ON');
+    }
+    console.log('[agent-store] schema migration completed');
   }
 
   close(): void {

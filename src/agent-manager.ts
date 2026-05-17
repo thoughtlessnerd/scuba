@@ -16,6 +16,16 @@ import { PtyStateDetector, type AwaitingChoiceInfo, type StateTransitionEvent } 
 const DEFAULT_COLS = 120;
 const DEFAULT_ROWS = 40;
 const DEFAULT_GROUP_COLOR = '#9ece6a';
+/**
+ * How long the terminal must stay in ready/idle after a turn before we count
+ * it as actually finished. Claude's TUI briefly flips back to the prompt
+ * between tool calls / message segments — firing turn-end on the first blink
+ * sends premature "replied" screenshots. Override via TURN_END_DEBOUNCE_MS env.
+ */
+const TURN_END_DEBOUNCE_MS = (() => {
+  const raw = Number(process.env.TURN_END_DEBOUNCE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 1500;
+})();
 
 export interface SpawnWorkerOptions {
   cwd: string;
@@ -33,6 +43,13 @@ export interface SpawnMotherOptions {
   name?: string;
 }
 
+export interface SpawnAdhocOptions {
+  cwd: string;
+  chatId: string;
+  name?: string;
+  systemPrompt?: string;
+}
+
 export interface CreateGroupOptions {
   name: string;
   color?: string;
@@ -47,6 +64,8 @@ export interface AgentTerminal {
   draining: boolean;
   /** Set when we write input. Cleared on turn-end (idle/ready after working). */
   hadInputSinceTurnEnd: boolean;
+  /** Debounced turn-end emit. Cancelled if the terminal flips back to working. */
+  turnEndTimer: NodeJS.Timeout | null;
 }
 
 export interface AgentManagerEvents {
@@ -102,6 +121,7 @@ export class AgentManager extends EventEmitter {
 
   shutdown(): void {
     for (const t of this.terminals.values()) {
+      if (t.turnEndTimer) { clearTimeout(t.turnEndTimer); t.turnEndTimer = null; }
       try { t.pty.kill(); } catch {}
       t.detector.destroy();
     }
@@ -176,14 +196,60 @@ export class AgentManager extends EventEmitter {
     return term;
   }
 
+  /**
+   * Spawn an isolated adhoc claude terminal. Unlike mother/worker, adhoc has:
+   * no MCP server (just runs in user's cwd), no group, no role-coupling
+   * (cannot spawn other terminals, cannot be sent to by mother). Routing to
+   * Telegram for awaiting-choice prompts works via record.chatId — the same
+   * PromptRouter path workers use.
+   */
+  spawnAdhoc(opts: SpawnAdhocOptions): AgentTerminal {
+    const cwd = resolveCwd(opts.cwd);
+    const claudeSessionId = randomUUID();
+    const id = randomUUID();
+    const name = (opts.name?.trim() || 'claude').slice(0, 15);
+    const systemPrompt = opts.systemPrompt ?? '';
+    const args = [
+      '--session-id', claudeSessionId,
+      '--permission-mode', 'acceptEdits',
+      '-n', name,
+    ];
+    if (systemPrompt) args.push('--system-prompt', systemPrompt);
+    const proc = pty.spawn('claude', args, {
+      name: 'xterm-256color',
+      cwd,
+      env: process.env as Record<string, string>,
+      cols: DEFAULT_COLS,
+      rows: DEFAULT_ROWS,
+    });
+
+    const record: AgentTerminalRecord = {
+      id,
+      claudeSessionId,
+      cwd,
+      name,
+      groupId: null,
+      chatId: opts.chatId,
+      systemPrompt,
+      role: 'adhoc',
+      createdAt: Date.now(),
+    };
+    this.store.insertTerminal(record);
+    return this.registerSpawn(proc, record);
+  }
+
   spawnMother(opts: SpawnMotherOptions): AgentTerminal {
     const existing = this.store.getMother();
     if (existing) {
+      // Whether the PTY is live or stale, the user clicking "Spawn mother"
+      // means they want a fresh mother. Kill any live PTY first, then drop
+      // the row so the spawn below isn't blocked by it.
       const live = this.terminals.get(existing.id);
-      if (live) return live;
-      // Stale record — the PTY died (server restart with no usable session
-      // snapshot, crash, etc). Clear it and spawn fresh; the user clicking
-      // "Spawn mother" expects a working mother, not another resume attempt.
+      if (live) {
+        try { live.pty.kill(); } catch {}
+        try { live.detector.destroy(); } catch {}
+        this.terminals.delete(existing.id);
+      }
       this.store.deleteTerminal(existing.id);
     }
 
@@ -227,8 +293,8 @@ export class AgentManager extends EventEmitter {
       '--resume', rec.claudeSessionId,
       '--permission-mode', 'acceptEdits',
       '-n', rec.name,
-      '--system-prompt', rec.systemPrompt,
     ];
+    if (rec.systemPrompt) args.push('--system-prompt', rec.systemPrompt);
     const proc = pty.spawn('claude', args, {
       name: 'xterm-256color',
       cwd,
@@ -281,12 +347,18 @@ export class AgentManager extends EventEmitter {
 
   killTerminal(id: string): boolean {
     const t = this.terminals.get(id);
-    if (!t) return false;
-    const groupId = t.record.groupId;
-    try { t.pty.kill(); } catch {}
-    t.detector.destroy();
-    this.terminals.delete(id);
+    // Even if the PTY already died (and we removed it from the in-memory map),
+    // the DB row may still be there. Clean both regardless.
+    const rec = t?.record ?? this.store.getTerminal(id);
+    if (!rec) return false;
+    const groupId = rec.groupId;
+    if (t) {
+      try { t.pty.kill(); } catch {}
+      try { t.detector.destroy(); } catch {}
+      this.terminals.delete(id);
+    }
     this.store.deleteTerminal(id);
+    console.log(`[agent] killTerminal ${rec.name} (${rec.role}) — db row removed`);
 
     // If this was the last terminal in its group, delete the group too.
     if (groupId) {
@@ -317,6 +389,34 @@ export class AgentManager extends EventEmitter {
     return state === 'ready' || state === 'idle';
   }
 
+  /**
+   * Used by the Telegram bridge: when a user message arrives in a chat that has
+   * adhoc terminals bound to it, enqueue the text on each. Returns the number
+   * of terminals it reached.
+   */
+  enqueueForAdhocChat(chatId: string, text: string): number {
+    let hits = 0;
+    const adhocs = Array.from(this.terminals.values()).filter((t) => t.record.role === 'adhoc');
+    for (const t of adhocs) {
+      if (t.record.chatId !== chatId) continue;
+      if (t.detector.getState() === 'awaiting-choice') {
+        console.warn(
+          `[agent] adhoc ${t.record.name} got TG text but is awaiting choice — dropped. Use the inline buttons to answer first.`,
+        );
+        continue;
+      }
+      this.enqueueInput(t.record.id, text);
+      hits++;
+      console.log(`[agent] enqueued TG text → adhoc ${t.record.name} (chat ${chatId})`);
+    }
+    if (hits === 0 && adhocs.length > 0) {
+      console.log(
+        `[agent] TG msg on chat ${chatId} matched no adhoc terminal (have ${adhocs.length}: ${adhocs.map((t) => `${t.record.name}=${t.record.chatId}`).join(', ')})`,
+      );
+    }
+    return hits;
+  }
+
   /** Used by Telegram bridge for mother chat. Queue + drain when idle. */
   enqueueForMother(text: string): boolean {
     const mother = this.store.getMother();
@@ -326,12 +426,29 @@ export class AgentManager extends EventEmitter {
     return true;
   }
 
-  /** Used by Telegram bridge for inline-keyboard callback. Writes raw digit + Enter immediately. */
+  /**
+   * Used by Telegram bridge for inline-keyboard callback. Writes the digit, then
+   * Enter ~80ms later as a separate chunk. Sending them together causes Ink's
+   * stdin handler to read the (still stale) input on the Enter event and ignore
+   * the choice — the same race that writeAsPaste works around for queued input.
+   */
   answerAwaitingChoice(id: string, choice: number): boolean {
     const t = this.terminals.get(id);
-    if (!t) return false;
-    if (t.detector.getState() !== 'awaiting-choice') return false;
-    t.pty.write(`${choice}\r`);
+    if (!t) {
+      console.warn(`[agent] answerAwaitingChoice: terminal ${id} not live`);
+      return false;
+    }
+    if (t.detector.getState() !== 'awaiting-choice') {
+      console.warn(
+        `[agent] answerAwaitingChoice: ${t.record.name} state=${t.detector.getState()} (not awaiting)`,
+      );
+      return false;
+    }
+    t.pty.write(`${choice}`);
+    setTimeout(() => {
+      try { t.pty.write('\r'); } catch {}
+    }, 80);
+    console.log(`[agent] answerAwaitingChoice: ${t.record.name} chose ${choice}`);
     return true;
   }
 
@@ -377,6 +494,7 @@ export class AgentManager extends EventEmitter {
       queue: [],
       draining: false,
       hadInputSinceTurnEnd: false,
+      turnEndTimer: null,
     };
     this.terminals.set(rec.id, term);
 
@@ -387,6 +505,7 @@ export class AgentManager extends EventEmitter {
       console.log(
         `[agent] terminal "${rec.name}" (${rec.role}) exited code=${exitCode} signal=${signal ?? '-'}`,
       );
+      if (term.turnEndTimer) { clearTimeout(term.turnEndTimer); term.turnEndTimer = null; }
       detector.destroy();
       this.terminals.delete(rec.id);
       this.emit('exit', rec.id, exitCode);
@@ -403,11 +522,31 @@ export class AgentManager extends EventEmitter {
         this.drainQueue(rec.id);
 
         // Turn-end: working → ready/idle AND we wrote input since last turn-end.
-        // Mother chat gets a screenshot of the response. Workers nudge mother
-        // through their own path; they don't post directly.
+        // Mother and adhoc mirror their replies to the bound chat. Schedule
+        // the emit a beat later, since claude's TUI briefly flips to ready
+        // between tool calls — without the debounce we fire on every blink.
         if (evt.from === 'working' && term.hadInputSinceTurnEnd) {
-          term.hadInputSinceTurnEnd = false;
-          if (rec.role === 'mother') this.emit('turnEnd', rec.id);
+          if (rec.role === 'mother' || rec.role === 'adhoc') {
+            if (term.turnEndTimer) clearTimeout(term.turnEndTimer);
+            term.turnEndTimer = setTimeout(() => {
+              term.turnEndTimer = null;
+              if (!term.hadInputSinceTurnEnd) return;
+              const state = term.detector.getState();
+              if (state !== 'ready' && state !== 'idle') return;
+              term.hadInputSinceTurnEnd = false;
+              this.emit('turnEnd', rec.id);
+            }, TURN_END_DEBOUNCE_MS);
+          } else {
+            // Workers don't post directly, so we can clear immediately.
+            term.hadInputSinceTurnEnd = false;
+          }
+        }
+      } else {
+        // Moved off ready/idle (back to working or into awaiting-choice).
+        // Cancel any pending turn-end emit.
+        if (term.turnEndTimer) {
+          clearTimeout(term.turnEndTimer);
+          term.turnEndTimer = null;
         }
       }
       if (evt.to === 'idle') {

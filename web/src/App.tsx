@@ -134,6 +134,7 @@ export default function App() {
           setActiveSessionId(sid);
         }}
         onSpawn={spawn}
+        onSpawnedClaude={refreshAll}
         onKillSession={killSession}
         onPatchSession={patchSession}
         onNewGroup={newGroup}
@@ -148,7 +149,6 @@ export default function App() {
         activeSessionId={activeSessionId}
         onSelect={setActiveSessionId}
         onRenameSession={(id, name) => patchSession(id, { name })}
-        onMotherSpawned={refreshAll}
       />
       <TelegramPanel collapsed={tgCollapsed} onToggle={() => setTgCollapsed((v) => !v)} />
     </div>

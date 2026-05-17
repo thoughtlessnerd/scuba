@@ -194,6 +194,7 @@ export interface MotherStatus {
   alive: boolean;
   configured: boolean;
   state?: 'working' | 'idle' | 'awaiting-choice' | null;
+  record?: { chatId: string | null } & Record<string, unknown>;
 }
 
 export async function getMotherStatus(): Promise<MotherStatus> {
@@ -208,4 +209,28 @@ export async function spawnMother(): Promise<void> {
     const { error } = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(error || 'Failed to spawn mother');
   }
+}
+
+export async function listBoundChatIds(): Promise<string[]> {
+  const res = await fetch('/api/agent/bound-chats');
+  if (!res.ok) throw new Error(`listBoundChatIds: ${res.status}`);
+  const { chatIds } = (await res.json()) as { chatIds: string[] };
+  return chatIds;
+}
+
+export async function spawnAdhocClaude(input: {
+  cwd: string;
+  chatId: string;
+  name?: string;
+}): Promise<SessionInfo> {
+  const res = await fetch('/api/agent/adhoc', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    const { error } = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(error || 'Failed to spawn claude');
+  }
+  return res.json();
 }

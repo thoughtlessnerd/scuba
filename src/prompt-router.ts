@@ -21,6 +21,13 @@ export class PromptRouter {
    * 2 times…" and just got the second permission check) bypasses the cooldown.
    */
   private lastAnswered = new Map<string, { hash: string; at: number }>();
+  /**
+   * Terminals we're currently posting a prompt for. Claimed synchronously
+   * at the top of handleAwaiting, released after the pending row is inserted
+   * (or on error). Bridges the race where the PTY emits two awaitingChoice
+   * events before the first send → DB write has finished.
+   */
+  private inFlight = new Set<string>();
   private static readonly ANSWER_COOLDOWN_MS = 4000;
 
   constructor(
@@ -47,21 +54,38 @@ export class PromptRouter {
     });
   }
 
-  /** Mother's end-of-turn: post a screenshot of her response to her chat. */
+  /**
+   * End-of-turn: post a screenshot of the reply to the bound chat. Fires for
+   * mother (her assigned chat) and adhoc terminals (their picked chat).
+   * Workers go through notifyMotherOfIdle instead.
+   */
   private async handleTurnEnd(terminalId: string): Promise<void> {
     const t = this.agents.getTerminal(terminalId);
     if (!t) return;
-    if (t.record.role !== 'mother') return;
+    if (t.record.role !== 'mother' && t.record.role !== 'adhoc') return;
     const chatId = t.record.chatId;
     if (!chatId) return;
 
-    const screen = t.detector.getScreen();
-    if (!screen.trim()) return;
+    const screen = t.detector.getColoredScreen();
+    if (screen.length === 0) return;
     const png = await renderScreenPng(screen);
-    await this.telegram.sendMedia(chatId, 'photo', png, 'mother.png', 'image/png', 'mother replied');
+    const caption = t.record.role === 'mother' ? 'mother replied' : `${t.record.name} replied`;
+    await this.telegram.sendMedia(
+      chatId,
+      'photo',
+      png,
+      `${t.record.name}.png`,
+      'image/png',
+      caption,
+    );
   }
 
   private async handleAwaiting(terminalId: string, info: AwaitingChoiceInfo): Promise<void> {
+    // Sync gate: drop duplicate fires that arrive while we're still posting
+    // the first one (PTY redraws can emit awaitingChoice twice before any
+    // async work below completes).
+    if (this.inFlight.has(terminalId)) return;
+
     const t = this.agents.getTerminal(terminalId);
     if (!t) return;
     const chatId = t.record.chatId;
@@ -82,6 +106,20 @@ export class PromptRouter {
     const existing = this.store.listPendingPromptsForTerminal(terminalId);
     if (existing.length > 0) return;
 
+    this.inFlight.add(terminalId);
+    try {
+      await this.postAwaiting(terminalId, info, t, chatId);
+    } finally {
+      this.inFlight.delete(terminalId);
+    }
+  }
+
+  private async postAwaiting(
+    terminalId: string,
+    info: AwaitingChoiceInfo,
+    t: NonNullable<ReturnType<AgentManager['getTerminal']>>,
+    chatId: string,
+  ): Promise<void> {
     const promptId = randomUUID();
     const options: PendingPromptOption[] = info.options.map((o) => ({
       num: o.num,
@@ -96,7 +134,7 @@ export class PromptRouter {
 
     // Render the worker's current visible screen as a PNG and send as a photo
     // with the inline keyboard. This avoids HTML/Markdown parse fragility entirely.
-    const screen = t.detector.getScreen();
+    const screen = t.detector.getColoredScreen();
     const png = await renderScreenPng(screen);
 
     const sent = await this.telegram.sendMedia(
@@ -121,6 +159,7 @@ export class PromptRouter {
   }
 
   private async handleCallback(evt: TelegramCallback): Promise<void> {
+    console.log(`[prompt-router] callback data=${evt.data} chat=${evt.chatId}`);
     const parsed = parseCallbackData(evt.data);
     if (!parsed) {
       await this.telegram.answerCallbackQuery(evt.id, 'invalid callback');

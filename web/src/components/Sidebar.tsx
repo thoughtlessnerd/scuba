@@ -1,9 +1,11 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { GroupInfo, GroupType, SessionInfo } from '../types';
 import { EditableLabel } from './EditableLabel';
 import { ColorSwatch } from './ColorSwatch';
 import { EyeIcon, EyeOffIcon, ChevronIcon, PlusIcon } from './Icons';
 import { sessionLabel } from '../labels';
+import { NewClaudeModal } from './NewClaudeModal';
+import * as api from '../api';
 
 interface Props {
   sessions: SessionInfo[];
@@ -14,6 +16,7 @@ interface Props {
   onSelectGroup: (id: string) => void;
   onSelectSession: (id: string) => void;
   onSpawn: (cwd: string) => Promise<void>;
+  onSpawnedClaude: () => void;
   onKillSession: (id: string) => void;
   onPatchSession: (
     id: string,
@@ -42,12 +45,14 @@ export function Sidebar(props: Props) {
     onNewGroup,
     onPatchGroup,
     onRemoveGroup,
+    onSpawnedClaude,
   } = props;
 
   const [cwd, setCwd] = useState('~');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [showClaudeModal, setShowClaudeModal] = useState(false);
 
   const sessionsByGroup = useMemo(() => {
     const map = new Map<string, SessionInfo[]>();
@@ -80,6 +85,7 @@ export function Sidebar(props: Props) {
     <aside className="sidebar">
       <header>
         <h1>scuba</h1>
+        <MotherButton />
         <button className="ghost-btn" onClick={() => onNewGroup('tabs')} title="New group">
           <PlusIcon /> Group
         </button>
@@ -95,11 +101,29 @@ export function Sidebar(props: Props) {
           autoCapitalize="off"
           autoCorrect="off"
         />
-        <button type="submit" disabled={busy}>
-          {busy ? 'Spawning…' : 'New terminal'}
-        </button>
+        <div className="spawn-actions">
+          <button type="submit" disabled={busy}>
+            {busy ? 'Spawning…' : 'New terminal'}
+          </button>
+          <button
+            type="button"
+            className="claude-btn"
+            disabled={busy}
+            onClick={() => { setError(null); setShowClaudeModal(true); }}
+          >
+            New claude
+          </button>
+        </div>
         {error && <div className="err">{error}</div>}
       </form>
+
+      {showClaudeModal && (
+        <NewClaudeModal
+          initialCwd={cwd}
+          onCancel={() => setShowClaudeModal(false)}
+          onSpawned={() => { setShowClaudeModal(false); onSpawnedClaude(); }}
+        />
+      )}
 
       <div className="tree">
         <GroupSection
@@ -282,6 +306,58 @@ interface SessionRowProps {
   onSelect: () => void;
   onPatch: (patch: Partial<Pick<SessionInfo, 'name' | 'hidden' | 'groupId'>>) => void;
   onKill: () => void;
+}
+
+/**
+ * Compact mother-status button in the sidebar header. Replaces the
+ * empty-state "Spawn mother claude" CTA so the control stays reachable
+ * once other terminals exist.
+ */
+function MotherButton() {
+  const [status, setStatus] = useState<api.MotherStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    try { setStatus(await api.getMotherStatus()); } catch {}
+  };
+
+  useEffect(() => {
+    void refresh();
+    const id = setInterval(refresh, 1500);
+    return () => clearInterval(id);
+  }, []);
+
+  if (!status) return null;
+  if (!status.configured) {
+    return (
+      <button
+        className="ghost-btn mother-btn disabled"
+        title="Set MOTHER_TELEGRAM_CHAT_ID in .env to enable mother"
+        disabled
+      >
+        Mother: off
+      </button>
+    );
+  }
+
+  const onClick = async () => {
+    if (status.alive && !confirm('Mother is already running. Restart her?')) return;
+    setBusy(true);
+    try { await api.spawnMother(); await refresh(); }
+    catch (err) { alert((err as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <button
+      className={`ghost-btn mother-btn ${status.alive ? 'alive' : ''}`}
+      disabled={busy}
+      onClick={onClick}
+      title={status.alive ? 'Mother is running — click to restart' : 'Spawn mother claude'}
+    >
+      {busy ? '…' : status.alive ? 'Mother: live' : 'Spawn mother'}
+    </button>
+  );
 }
 
 function SessionRow({ session, groups, active, onSelect, onPatch, onKill }: SessionRowProps) {
