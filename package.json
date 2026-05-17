@@ -4,7 +4,8 @@
   "description": "Spawn terminals in any folder from your browser.",
   "type": "module",
   "bin": {
-    "scuba": "./dist/cli.js"
+    "scuba": "./dist/cli.js",
+    "scuba-mcp": "./dist/mcp-server.js"
   },
   "files": [
     "dist",
@@ -24,12 +25,18 @@
     "postinstall": "node scripts/fix-pty-perms.mjs"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@xterm/headless": "^6.0.0",
+    "better-sqlite3": "^12.10.0",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
     "node-pty": "^1.0.0",
-    "ws": "^8.18.0"
+    "sharp": "^0.34.5",
+    "ws": "^8.18.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.0",
     "@types/node": "^22.10.0",
     "@types/react": "^18.3.0",

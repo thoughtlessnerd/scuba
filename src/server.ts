@@ -4,9 +4,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { WebSocketServer, type WebSocket } from 'ws';
+import os from 'node:os';
 import { SessionManager } from './sessions.js';
 import { TelegramManager, type TelegramChat, type TelegramMessage, type MediaKind } from './telegram.js';
 import type { ClientMessage, ServerMessage, TelegramServerEvent } from './protocol.js';
+import { AgentStore } from './agent-store.js';
+import { AgentManager } from './agent-manager.js';
+import { PromptRouter } from './prompt-router.js';
+import { MOTHER_SYSTEM_PROMPT } from './mother-prompt.js';
+import { prepareMotherCwd } from './mother-setup.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -22,7 +28,63 @@ export async function startServer(opts: ServerOptions): Promise<http.Server> {
 
   const mgr = new SessionManager();
   const telegram = new TelegramManager(process.env.TELEGRAM_BOT_TOKEN);
-  void telegram.start();
+  await telegram.start();
+
+  const store = new AgentStore();
+  const agents = new AgentManager(mgr, store);
+
+  // Pre-write mother's MCP config so bootstrap's --resume of a saved mother
+  // sees the scuba MCP server. No-op if mother isn't configured yet.
+  if (process.env.MOTHER_TELEGRAM_CHAT_ID?.trim()) {
+    try { prepareMotherCwd(process.env.MOTHER_CWD, opts.port); } catch (err) {
+      console.error('[agent] prepareMotherCwd failed:', (err as Error).message);
+    }
+  }
+
+  await agents.bootstrap();
+  const promptRouter = new PromptRouter(agents, telegram, store);
+  promptRouter.start();
+
+  // Mother is spawned manually via POST /api/agent/mother. If she's already in
+  // the DB, bootstrap() above has restored her PTY via --resume.
+  const motherChatId = (process.env.MOTHER_TELEGRAM_CHAT_ID ?? '').trim();
+  if (motherChatId) {
+    const existing = store.getMother();
+    if (existing) console.log(`[agent] mother restored from db (chat ${existing.chatId})`);
+
+    // Route incoming user messages on the mother chat into her input queue.
+    // Slash commands prefixed with `/` are handled by scuba directly and not forwarded.
+    telegram.on('message', (m: TelegramMessage) => {
+      if (m.from !== 'user') return;
+      if (m.chatId !== motherChatId) return;
+      const text = (m.text ?? '').trim();
+      if (!text) return;
+
+      if (text === '/clear-mother') {
+        const ok = agents.typeIntoMother('/clear\r');
+        void telegram.sendMessage(motherChatId, ok ? 'mother context cleared.' : 'mother not alive.');
+        return;
+      }
+      if (text === '/respawn-all') {
+        const { restarted } = agents.restartAll();
+        void telegram.sendMessage(motherChatId, `respawned ${restarted} terminal(s).`);
+        return;
+      }
+      if (text === '/status') {
+        const ts = agents.listTerminals();
+        const lines = ts.length === 0
+          ? ['no terminals.']
+          : ts.map((t) => `• ${t.record.name} (${t.record.role}) — ${t.detector.getState()}`);
+        void telegram.sendMessage(motherChatId, lines.join('\n'));
+        return;
+      }
+
+      const enqueued = agents.enqueueForMother(text);
+      if (!enqueued) console.warn('[agent] mother chat got message but mother is not alive');
+    });
+  } else {
+    console.log('[agent] MOTHER_TELEGRAM_CHAT_ID not set — mother disabled');
+  }
 
   app.get('/api/sessions', (_req, res) => {
     res.json(mgr.listSessions());
@@ -47,6 +109,14 @@ export async function startServer(opts: ServerOptions): Promise<http.Server> {
   });
 
   app.delete('/api/sessions/:id', (req, res) => {
+    // If this is an agent terminal (mother or worker), route through agent-manager
+    // so the DB row is removed too. Without this, bootstrap on next server start
+    // would --resume her and she'd come back from the dead.
+    if (agents.getTerminal(req.params.id)) {
+      const ok = agents.killTerminal(req.params.id);
+      res.status(ok ? 204 : 404).end();
+      return;
+    }
     const ok = mgr.killSession(req.params.id);
     res.status(ok ? 204 : 404).end();
   });
@@ -183,6 +253,135 @@ export async function startServer(opts: ServerOptions): Promise<http.Server> {
     }
   });
 
+  // ----- agent tool endpoints (consumed by the MCP subprocess) -----
+
+  app.get('/api/agent/chats', (_req, res) => {
+    res.json(
+      telegram.listChats().map((c) => ({
+        chatId: c.chatId,
+        title: c.title ?? c.label ?? c.chatId,
+        type: c.type,
+      })),
+    );
+  });
+
+  app.get('/api/agent/groups', (_req, res) => {
+    res.json(agents.listGroups());
+  });
+
+  app.post('/api/agent/groups', (req, res) => {
+    try {
+      const { name, color, taskDescription } = req.body ?? {};
+      if (typeof name !== 'string' || !name.trim()) {
+        res.status(400).json({ error: 'name required' });
+        return;
+      }
+      res.json(agents.createGroup({ name, color, taskDescription }));
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/agent/terminals', (req, res) => {
+    const groupId = typeof req.query.groupId === 'string' ? req.query.groupId : undefined;
+    const list = agents.listTerminals();
+    const out = list
+      .filter((t) => (groupId ? t.record.groupId === groupId : true))
+      .map((t) => ({
+        ...t.record,
+        state: t.detector.getState(),
+      }));
+    res.json(out);
+  });
+
+  app.post('/api/agent/terminals', (req, res) => {
+    try {
+      const { cwd, name, groupId, chatId, systemPrompt, initialTask } = req.body ?? {};
+      if (typeof cwd !== 'string' || !cwd.trim()) throw new Error('cwd required');
+      if (typeof name !== 'string' || !name.trim()) throw new Error('name required');
+      if (typeof systemPrompt !== 'string') throw new Error('systemPrompt required');
+      const t = agents.spawnWorker({
+        cwd: cwd.trim(),
+        name: name.trim(),
+        groupId: groupId ?? null,
+        chatId: chatId ?? null,
+        systemPrompt,
+        initialTask,
+      });
+      res.json({ ...t.record, state: t.detector.getState() });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/agent/terminals/:id', (req, res) => {
+    const ok = agents.killTerminal(req.params.id);
+    res.status(ok ? 204 : 404).end();
+  });
+
+  app.post('/api/agent/terminals/:id/send', (req, res) => {
+    try {
+      const text = String(req.body?.text ?? '');
+      if (!text) throw new Error('text required');
+      agents.sendToWorker(req.params.id, text);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/agent/terminals/:id/tail', (req, res) => {
+    const t = agents.getTerminal(req.params.id);
+    if (!t) {
+      res.status(404).end();
+      return;
+    }
+    const lines = Math.max(1, Math.min(200, Number(req.query.lines ?? 40)));
+    res.json({ state: t.detector.getState(), tail: t.detector.getTail(lines) });
+  });
+
+  app.get('/api/agent/mother', (_req, res) => {
+    const rec = store.getMother();
+    if (!rec) {
+      res.json({ alive: false, configured: Boolean(motherChatId) });
+      return;
+    }
+    const live = agents.getTerminal(rec.id);
+    res.json({
+      alive: Boolean(live),
+      configured: Boolean(motherChatId),
+      record: rec,
+      state: live?.detector.getState() ?? null,
+    });
+  });
+
+  app.post('/api/agent/mother', (_req, res) => {
+    try {
+      if (!motherChatId) throw new Error('MOTHER_TELEGRAM_CHAT_ID is not set in .env');
+      const cwd = prepareMotherCwd(process.env.MOTHER_CWD, opts.port);
+      const t = agents.spawnMother({
+        cwd,
+        chatId: motherChatId,
+        systemPrompt: MOTHER_SYSTEM_PROMPT,
+      });
+      res.json({ ...t.record, state: t.detector.getState() });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/agent/ask-human', async (req, res) => {
+    try {
+      if (!motherChatId) throw new Error('mother chat not configured');
+      const text = String(req.body?.text ?? '');
+      if (!text.trim()) throw new Error('text required');
+      const msg = await telegram.sendMessage(motherChatId, text);
+      res.json({ messageId: msg.id });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
   if (opts.dev) {
     app.get('/', (_req, res) => res.redirect('http://localhost:5173'));
   } else {
@@ -238,7 +437,13 @@ export async function startServer(opts: ServerOptions): Promise<http.Server> {
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      attachSession(ws, session.pty);
+      const onResize = (cols: number, rows: number) => {
+        // Keep the state detector's headless terminal in sync with the PTY's
+        // actual size, otherwise long option lines wrap differently in the
+        // detector vs claude's rendering and the parser misses them.
+        agents.getTerminal(id)?.detector.resize(cols, rows);
+      };
+      attachSession(ws, session.pty, session.buffer, onResize);
     });
   });
 
@@ -246,10 +451,21 @@ export async function startServer(opts: ServerOptions): Promise<http.Server> {
   return server;
 }
 
-function attachSession(ws: import('ws').WebSocket, proc: import('node-pty').IPty) {
+function attachSession(
+  ws: import('ws').WebSocket,
+  proc: import('node-pty').IPty,
+  replay: string,
+  onResize?: (cols: number, rows: number) => void,
+) {
   const send = (msg: ServerMessage) => {
     if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
   };
+
+  // Replay recent output so the client's xterm renders the current screen
+  // immediately on (re)attach. This is what restores the visible state after
+  // a browser refresh — works for any TUI (shell, vim, claude code) because
+  // we're literally re-feeding xterm the same bytes it would have rendered.
+  if (replay && replay.length > 0) send({ type: 'output', data: replay });
 
   const dataSub = proc.onData((data) => send({ type: 'output', data }));
   const exitSub = proc.onExit(({ exitCode, signal }) => {
@@ -257,7 +473,6 @@ function attachSession(ws: import('ws').WebSocket, proc: import('node-pty').IPty
     ws.close();
   });
 
-  let nudged = false;
   ws.on('message', (raw) => {
     let msg: ClientMessage;
     try {
@@ -268,12 +483,7 @@ function attachSession(ws: import('ws').WebSocket, proc: import('node-pty').IPty
     if (msg.type === 'input') proc.write(msg.data);
     else if (msg.type === 'resize') {
       proc.resize(msg.cols, msg.rows);
-      if (!nudged) {
-        nudged = true;
-        setTimeout(() => {
-          try { proc.write('\x0c'); } catch {}
-        }, 30);
-      }
+      onResize?.(msg.cols, msg.rows);
     }
   });
 

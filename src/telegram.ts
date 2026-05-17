@@ -43,6 +43,24 @@ export interface TelegramMessage {
   media?: TelegramMedia;
 }
 
+export interface InlineKeyboardButton {
+  text: string;
+  callback_data?: string;
+  url?: string;
+}
+
+export interface InlineKeyboardMarkup {
+  inline_keyboard: InlineKeyboardButton[][];
+}
+
+export interface TelegramCallback {
+  id: string;
+  chatId: string;
+  messageId: number;
+  data: string;
+  from?: { id: string; name?: string };
+}
+
 const RETENTION_SECONDS = RETENTION_DAYS * 24 * 60 * 60;
 const COMPACT_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
@@ -231,10 +249,21 @@ export class TelegramManager extends EventEmitter {
     return this.messages.get(chatId) ?? [];
   }
 
-  async sendMessage(chatId: string, text: string): Promise<TelegramMessage> {
+  async sendMessage(
+    chatId: string,
+    text: string,
+    opts: { parseMode?: 'Markdown' | 'MarkdownV2' | 'HTML'; replyMarkup?: InlineKeyboardMarkup } = {},
+  ): Promise<TelegramMessage> {
     if (!this.token) throw new Error('telegram not configured');
-    if (!this.chats.has(chatId)) throw new Error('unknown chatId');
-    const result = await this.api('sendMessage', { chat_id: chatId, text });
+    if (!this.chats.has(chatId)) {
+      // Auto-register chats we send to. Useful for sending into a known-good chat that
+      // the bot hasn't received a message from yet but was configured externally.
+      this.addChat(chatId);
+    }
+    const body: Record<string, unknown> = { chat_id: chatId, text };
+    if (opts.parseMode) body.parse_mode = opts.parseMode;
+    if (opts.replyMarkup) body.reply_markup = opts.replyMarkup;
+    const result = await this.api('sendMessage', body);
     const msg: TelegramMessage = {
       id: result.message_id,
       chatId,
@@ -247,6 +276,32 @@ export class TelegramManager extends EventEmitter {
     return msg;
   }
 
+  async editMessageReplyMarkup(
+    chatId: string,
+    messageId: number,
+    replyMarkup: InlineKeyboardMarkup | null,
+  ): Promise<void> {
+    if (!this.token) throw new Error('telegram not configured');
+    await this.api('editMessageReplyMarkup', {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: replyMarkup ?? { inline_keyboard: [] },
+    });
+  }
+
+  async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
+    if (!this.token) return;
+    try {
+      await this.api('answerCallbackQuery', {
+        callback_query_id: callbackQueryId,
+        text: text ?? '',
+      });
+    } catch (e) {
+      // Non-fatal — Telegram permits the callback to be unanswered.
+      console.error('[telegram] answerCallbackQuery failed:', (e as Error).message);
+    }
+  }
+
   async sendMedia(
     chatId: string,
     kind: MediaKind,
@@ -254,15 +309,17 @@ export class TelegramManager extends EventEmitter {
     filename: string,
     mimeType: string,
     caption?: string,
+    opts: { replyMarkup?: InlineKeyboardMarkup } = {},
   ): Promise<TelegramMessage> {
     if (!this.token) throw new Error('telegram not configured');
-    if (!this.chats.has(chatId)) throw new Error('unknown chatId');
+    if (!this.chats.has(chatId)) this.addChat(chatId);
     const spec = SEND_METHOD_BY_KIND[kind];
     if (!spec) throw new Error(`unsupported send kind: ${kind}`);
 
     const form = new FormData();
     form.set('chat_id', chatId);
     if (caption) form.set('caption', caption);
+    if (opts.replyMarkup) form.set('reply_markup', JSON.stringify(opts.replyMarkup));
     form.set(spec.field, new Blob([new Uint8Array(buf)], { type: mimeType }), filename);
 
     const url = `https://api.telegram.org/bot${this.token}/${spec.method}`;
@@ -324,12 +381,37 @@ export class TelegramManager extends EventEmitter {
           {
             offset: this.offset,
             timeout: 25,
-            allowed_updates: ['message', 'channel_post', 'edited_message', 'edited_channel_post'],
+            allowed_updates: [
+              'message',
+              'channel_post',
+              'edited_message',
+              'edited_channel_post',
+              'callback_query',
+            ],
           },
           35000,
         );
         for (const u of updates) {
           this.offset = u.update_id + 1;
+          if (u.callback_query) {
+            const cb = u.callback_query;
+            const evt: TelegramCallback = {
+              id: String(cb.id),
+              chatId: String(cb.message?.chat?.id ?? ''),
+              messageId: Number(cb.message?.message_id ?? 0),
+              data: String(cb.data ?? ''),
+              from: cb.from
+                ? {
+                    id: String(cb.from.id),
+                    name:
+                      [cb.from.first_name, cb.from.last_name].filter(Boolean).join(' ') ||
+                      cb.from.username,
+                  }
+                : undefined,
+            };
+            this.emit('callback', evt);
+            continue;
+          }
           const m = u.message ?? u.channel_post ?? u.edited_message ?? u.edited_channel_post;
           if (!m) continue;
           const chatId = String(m.chat.id);

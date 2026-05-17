@@ -1,6 +1,17 @@
 #!/usr/bin/env node
-import 'dotenv/config';
-import { startServer } from './server.js';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { existsSync } from 'node:fs';
+import dotenv from 'dotenv';
+
+// Load .env from cwd first, then fall back to the package root (one level above dist/).
+// This way `scuba start` works both from inside the repo and from arbitrary cwds.
+dotenv.config();
+const here = path.dirname(fileURLToPath(import.meta.url));
+const pkgEnv = path.resolve(here, '..', '.env');
+if (existsSync(pkgEnv)) dotenv.config({ path: pkgEnv, override: false });
+
+const { startServer } = await import('./server.js');
 
 interface CliArgs {
   command: string;

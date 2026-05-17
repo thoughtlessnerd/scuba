@@ -19,7 +19,11 @@ const DEFAULT_GROUP_COLOR = '#7aa2f7';
 export interface Session {
   info: SessionInfo;
   pty: IPty;
+  /** Recent PTY output, capped. Replayed on each WS attach to restore the visible screen. */
+  buffer: string;
 }
+
+const BUFFER_CAP = 256 * 1024;
 
 export class SessionManager {
   private sessions = new Map<string, Session>();
@@ -48,11 +52,33 @@ export class SessionManager {
       hidden: false,
       groupId,
     };
-    const session: Session = { info, pty: proc };
+    const session: Session = { info, pty: proc, buffer: '' };
+    this.attachBuffer(session);
 
     proc.onExit(() => this.sessions.delete(id));
     this.sessions.set(id, session);
     return session;
+  }
+
+  private attachBuffer(session: Session): void {
+    session.pty.onData((data) => {
+      session.buffer = (session.buffer + data).slice(-BUFFER_CAP);
+    });
+  }
+
+  /** Register a PTY spawned outside SessionManager (e.g. by AgentManager). */
+  registerSession(pty: IPty, info: SessionInfo): Session {
+    const session: Session = { info, pty, buffer: '' };
+    this.attachBuffer(session);
+    pty.onExit(() => this.sessions.delete(info.id));
+    this.sessions.set(info.id, session);
+    return session;
+  }
+
+  /** Create an empty group with a caller-chosen id (used by AgentManager to mirror DB groups). */
+  registerGroup(info: GroupInfo): GroupInfo {
+    this.groups.set(info.id, info);
+    return info;
   }
 
   getSession(id: string): Session | undefined {

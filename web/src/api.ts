@@ -189,3 +189,23 @@ export async function sendTelegramMessage(chatId: string, text: string): Promise
   }
   return res.json();
 }
+
+export interface MotherStatus {
+  alive: boolean;
+  configured: boolean;
+  state?: 'working' | 'idle' | 'awaiting-choice' | null;
+}
+
+export async function getMotherStatus(): Promise<MotherStatus> {
+  const res = await fetch('/api/agent/mother');
+  if (!res.ok) throw new Error(`getMotherStatus: ${res.status}`);
+  return res.json();
+}
+
+export async function spawnMother(): Promise<void> {
+  const res = await fetch('/api/agent/mother', { method: 'POST' });
+  if (!res.ok) {
+    const { error } = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(error || 'Failed to spawn mother');
+  }
+}

@@ -83,6 +83,19 @@ export default function App() {
     setActiveGroupId((curr) => (curr === id ? UNGROUPED_KEY : curr));
   }, []);
 
+  const refreshAll = useCallback(async () => {
+    const [s, g] = await Promise.all([api.listSessions(), api.listGroups()]);
+    setSessions(s);
+    setGroups(g);
+  }, []);
+
+  // Cheap polling so server-side spawns (workers spawned via mother's MCP, etc)
+  // become visible without a manual page refresh. 2s feels live enough.
+  useEffect(() => {
+    const id = setInterval(() => { void refreshAll(); }, 2000);
+    return () => clearInterval(id);
+  }, [refreshAll]);
+
   const activeGroup = useMemo<GroupInfo | null>(
     () => groups.find((g) => g.id === activeGroupIdOrNull) ?? null,
     [groups, activeGroupIdOrNull],
@@ -135,6 +148,7 @@ export default function App() {
         activeSessionId={activeSessionId}
         onSelect={setActiveSessionId}
         onRenameSession={(id, name) => patchSession(id, { name })}
+        onMotherSpawned={refreshAll}
       />
       <TelegramPanel collapsed={tgCollapsed} onToggle={() => setTgCollapsed((v) => !v)} />
     </div>

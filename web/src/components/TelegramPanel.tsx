@@ -20,6 +20,7 @@ export function TelegramPanel({ collapsed, onToggle }: Props) {
   const [sending, setSending] = useState(false);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [copiedId, setCopiedId] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -43,11 +44,11 @@ export function TelegramPanel({ collapsed, onToggle }: Props) {
   }, []);
 
   useEffect(() => {
-    const ws = new WebSocket(api.telegramSocketUrl());
-    wsRef.current = ws;
-    ws.onmessage = (e) => {
-      let evt: TelegramEvent;
-      try { evt = JSON.parse(e.data); } catch { return; }
+    let cancelled = false;
+    let retryTimer: number | null = null;
+    let retryDelay = 1000;
+
+    const handleEvent = (evt: TelegramEvent) => {
       if (evt.type === 'hello') {
         setStatus({ enabled: evt.enabled, bot: evt.bot ?? {} });
       } else if (evt.type === 'chat:add') {
@@ -67,7 +68,36 @@ export function TelegramPanel({ collapsed, onToggle }: Props) {
         });
       }
     };
-    return () => { ws.close(); };
+
+    const connect = () => {
+      if (cancelled) return;
+      const ws = new WebSocket(api.telegramSocketUrl());
+      wsRef.current = ws;
+      ws.onopen = () => {
+        retryDelay = 1000;
+        // Re-sync state in case anything got missed while disconnected.
+        api.listTelegramChats().then((cs) => { if (!cancelled) setChats(cs); }).catch(() => {});
+      };
+      ws.onmessage = (e) => {
+        let evt: TelegramEvent;
+        try { evt = JSON.parse(e.data); } catch { return; }
+        handleEvent(evt);
+      };
+      const scheduleReconnect = () => {
+        if (cancelled) return;
+        retryTimer = window.setTimeout(connect, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 15000);
+      };
+      ws.onclose = scheduleReconnect;
+      ws.onerror = () => { try { ws.close(); } catch {} };
+    };
+
+    connect();
+    return () => {
+      cancelled = true;
+      if (retryTimer) window.clearTimeout(retryTimer);
+      try { wsRef.current?.close(); } catch {}
+    };
   }, []);
 
   useEffect(() => {
@@ -183,7 +213,7 @@ export function TelegramPanel({ collapsed, onToggle }: Props) {
             {c.photoFileId
               ? <img src={api.telegramFileUrl(c.photoFileId)} alt="" />
               : <span className="tg-rail-initials">{initials(chatTitle(c))}</span>}
-            <span className="tg-rail-tooltip">{chatTitle(c)}</span>
+            <span className="tg-rail-tooltip">{chatTitle(c)} · {c.chatId}</span>
           </button>
         ))}
         <button
@@ -227,6 +257,20 @@ export function TelegramPanel({ collapsed, onToggle }: Props) {
           <div className="tg-header-main">
             <div className="tg-title">
               {activeChat ? chatTitle(activeChat) : 'Telegram'}
+              {activeChat && (
+                <span
+                  className="tg-title-id"
+                  title="Click to copy chat id"
+                  onClick={(e) => {
+                    void navigator.clipboard.writeText(activeChat.chatId);
+                    setCopiedId(true);
+                    window.setTimeout(() => setCopiedId(false), 1200);
+                    // Drop any selection that landed on the chip from the click.
+                    window.getSelection()?.removeAllRanges();
+                    (e.currentTarget as HTMLElement).blur();
+                  }}
+                >· {copiedId ? 'copied!' : activeChat.chatId}</span>
+              )}
             </div>
             <div className="tg-sub">
               {status?.enabled
