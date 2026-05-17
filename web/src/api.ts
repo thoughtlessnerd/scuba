@@ -1,4 +1,12 @@
-import type { GroupInfo, GroupType, SessionInfo } from './types';
+import type {
+  GroupInfo,
+  GroupType,
+  SessionInfo,
+  TelegramChat,
+  TelegramMediaKind,
+  TelegramMessage,
+  TelegramStatus,
+} from './types';
 
 export async function listSessions(): Promise<SessionInfo[]> {
   const res = await fetch('/api/sessions');
@@ -79,4 +87,105 @@ export async function deleteGroup(id: string): Promise<void> {
 export function sessionSocketUrl(id: string): string {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${location.host}/ws/sessions/${id}`;
+}
+
+export function telegramSocketUrl(): string {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.host}/ws/telegram`;
+}
+
+export async function getTelegramStatus(): Promise<TelegramStatus> {
+  const res = await fetch('/api/telegram/status');
+  if (!res.ok) throw new Error(`telegram status: ${res.status}`);
+  return res.json();
+}
+
+export async function listTelegramChats(): Promise<TelegramChat[]> {
+  const res = await fetch('/api/telegram/chats');
+  if (!res.ok) throw new Error(`telegram chats: ${res.status}`);
+  return res.json();
+}
+
+export async function addTelegramChat(chatId: string, label?: string): Promise<TelegramChat> {
+  const res = await fetch('/api/telegram/chats', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chatId, label }),
+  });
+  if (!res.ok) {
+    const { error } = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(error || 'Failed to add chat');
+  }
+  return res.json();
+}
+
+export async function removeTelegramChat(chatId: string): Promise<void> {
+  await fetch(`/api/telegram/chats/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
+}
+
+export async function clearTelegramMessages(chatId: string): Promise<void> {
+  await fetch(`/api/telegram/chats/${encodeURIComponent(chatId)}/messages`, { method: 'DELETE' });
+}
+
+export async function refreshTelegramChat(chatId: string): Promise<TelegramChat> {
+  const res = await fetch(`/api/telegram/chats/${encodeURIComponent(chatId)}/refresh`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(`refresh: ${res.status}`);
+  return res.json();
+}
+
+export async function getTelegramMessages(chatId: string): Promise<TelegramMessage[]> {
+  const res = await fetch(`/api/telegram/chats/${encodeURIComponent(chatId)}/messages`);
+  if (!res.ok) throw new Error(`telegram messages: ${res.status}`);
+  return res.json();
+}
+
+export function telegramFileUrl(fileId: string): string {
+  return `/api/telegram/files/${encodeURIComponent(fileId)}`;
+}
+
+export function kindForFile(file: File): TelegramMediaKind {
+  const t = file.type;
+  if (t.startsWith('image/') && t !== 'image/gif') return 'photo';
+  if (t === 'image/gif') return 'animation';
+  if (t.startsWith('video/')) return 'video';
+  if (t.startsWith('audio/')) return 'audio';
+  return 'document';
+}
+
+export async function sendTelegramMedia(
+  chatId: string,
+  file: File,
+  kind: TelegramMediaKind,
+  caption?: string,
+): Promise<TelegramMessage> {
+  const params = new URLSearchParams({ kind, filename: file.name });
+  if (caption) params.set('caption', caption);
+  const res = await fetch(
+    `/api/telegram/chats/${encodeURIComponent(chatId)}/send-media?${params.toString()}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+    },
+  );
+  if (!res.ok) {
+    const { error } = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(error || 'Failed to send media');
+  }
+  return res.json();
+}
+
+export async function sendTelegramMessage(chatId: string, text: string): Promise<TelegramMessage> {
+  const res = await fetch(`/api/telegram/chats/${encodeURIComponent(chatId)}/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) {
+    const { error } = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(error || 'Failed to send');
+  }
+  return res.json();
 }

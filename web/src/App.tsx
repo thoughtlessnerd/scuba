@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { Workspace } from './components/Workspace';
+import { TelegramPanel } from './components/TelegramPanel';
 import * as api from './api';
 import type { GroupInfo, GroupType, SessionInfo } from './types';
 
@@ -11,6 +12,7 @@ export default function App() {
   const [groups, setGroups] = useState<GroupInfo[]>([]);
   const [activeGroupId, setActiveGroupId] = useState<string>(UNGROUPED_KEY);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [tgCollapsed, setTgCollapsed] = useState(false);
 
   useEffect(() => {
     Promise.all([api.listSessions(), api.listGroups()])
@@ -104,7 +106,7 @@ export default function App() {
   }, [visibleInActiveGroup, activeSessionId]);
 
   return (
-    <div className="app">
+    <div className={`app ${tgCollapsed ? 'tg-collapsed' : ''}`}>
       <Sidebar
         sessions={sessions}
         groups={groups}
@@ -134,6 +136,7 @@ export default function App() {
         onSelect={setActiveSessionId}
         onRenameSession={(id, name) => patchSession(id, { name })}
       />
+      <TelegramPanel collapsed={tgCollapsed} onToggle={() => setTgCollapsed((v) => !v)} />
     </div>
   );
 }

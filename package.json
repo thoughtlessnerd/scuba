@@ -24,6 +24,7 @@
     "postinstall": "node scripts/fix-pty-perms.mjs"
   },
   "dependencies": {
+    "dotenv": "^16.6.1",
     "express": "^4.21.2",
     "node-pty": "^1.0.0",
     "ws": "^8.18.0"
@@ -35,15 +36,15 @@
     "@types/react-dom": "^18.3.0",
     "@types/ws": "^8.5.13",
     "@vitejs/plugin-react": "^4.3.4",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-web-links": "^0.11.0",
+    "@xterm/xterm": "^5.5.0",
     "concurrently": "^9.1.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.0",
-    "vite": "^6.0.0",
-    "@xterm/xterm": "^5.5.0",
-    "@xterm/addon-fit": "^0.10.0",
-    "@xterm/addon-web-links": "^0.11.0"
+    "vite": "^6.0.0"
   },
   "engines": {
     "node": ">=18"

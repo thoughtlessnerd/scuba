@@ -91,7 +91,7 @@ function GroupView({
   const gridStyle = useMemo(() => {
     if (type !== 'tiled') return undefined;
     const n = sessions.length || 1;
-    const cols = Math.ceil(Math.sqrt(n));
+    const cols = Math.min(3, Math.ceil(Math.sqrt(n)));
     const rows = Math.ceil(n / cols);
     return {
       gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
