@@ -21,6 +21,7 @@ interface CliArgs {
   port: number;
   dev: boolean;
   open: boolean;
+  keepAwake: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -30,6 +31,7 @@ function parseArgs(argv: string[]): CliArgs {
     port: 4242,
     dev: false,
     open: true,
+    keepAwake: true,
   };
 
   for (let i = 1; i < argv.length; i++) {
@@ -38,6 +40,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === '--port') args.port = Number(argv[++i]);
     else if (a === '--dev') args.dev = true;
     else if (a === '--no-open') args.open = false;
+    else if (a === '--no-keep-awake') args.keepAwake = false;
     else if (a === '-h' || a === '--help') {
       printHelp();
       process.exit(0);
@@ -57,6 +60,7 @@ Options (start):
   --host <host>   Bind host (default: 127.0.0.1)
   --port <port>   Bind port (default: 4242)
   --no-open       Don't auto-open the browser
+  --no-keep-awake Don't spawn caffeinate to prevent idle sleep (macOS only)
   --dev           Dev mode: skip serving built frontend
   -h, --help      Show help
 `);
@@ -178,12 +182,38 @@ async function main() {
 
   const { startServer } = await import('./server.js');
   await startServer({ host: args.host, port: args.port, dev: args.dev });
+  if (args.keepAwake) startKeepAwake();
   const apiUrl = `http://${args.host}:${args.port}`;
   if (args.dev) {
     console.log(`scuba (dev) — API at ${apiUrl}, UI at http://localhost:5173`);
   } else {
     console.log(`scuba running at ${apiUrl}`);
     if (args.open) openBrowser(apiUrl);
+  }
+}
+
+/**
+ * Prevent macOS idle/display/system sleep while scuba is running by spawning
+ * `caffeinate`. The `-w <pid>` flag binds its lifetime to our process — when
+ * scuba exits (clean or crash), caffeinate exits with it. No shutdown wiring
+ * needed. Lid-close sleep is NOT prevented; see README clamshell note.
+ */
+async function startKeepAwake(): Promise<void> {
+  if (process.platform !== 'darwin') return;
+  const { spawn } = await import('node:child_process');
+  try {
+    const child = spawn(
+      'caffeinate',
+      ['-d', '-i', '-m', '-s', '-u', '-w', String(process.pid)],
+      { stdio: 'ignore', detached: false },
+    );
+    child.on('error', (err) => {
+      console.warn(`[keep-awake] caffeinate failed to start: ${err.message}`);
+    });
+    child.unref();
+    console.log('[keep-awake] caffeinate spawned — idle/display/system sleep blocked while scuba runs');
+  } catch (err) {
+    console.warn(`[keep-awake] could not spawn caffeinate: ${(err as Error).message}`);
   }
 }
 
