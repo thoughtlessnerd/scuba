@@ -14,7 +14,7 @@ arrow-key history, Ctrl-C, all work as expected.
 scuba isn't on the public npm registry — install from source:
 
 ```bash
-git clone <repo> scuba
+git clone github.com/thoughtlessnerd/scuba scuba
 cd scuba
 npm install
 npm run build
