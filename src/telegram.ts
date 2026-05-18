@@ -289,6 +289,22 @@ export class TelegramManager extends EventEmitter {
     });
   }
 
+  /**
+   * Register the bot's command menu. Telegram clients use this to populate
+   * autocomplete + the "/" menu. In private chats, tapping a registered
+   * command sends the bare `/cmd` (no `@botname` suffix); in groups the
+   * suffix is always appended for disambiguation.
+   */
+  async setMyCommands(commands: { command: string; description: string }[]): Promise<void> {
+    if (!this.token) return;
+    try {
+      await this.api('setMyCommands', { commands });
+      console.log(`[telegram] registered ${commands.length} bot commands`);
+    } catch (e) {
+      console.warn('[telegram] setMyCommands failed:', (e as Error).message);
+    }
+  }
+
   async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
     if (!this.token) return;
     try {

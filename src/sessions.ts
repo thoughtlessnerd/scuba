@@ -25,6 +25,34 @@ export interface Session {
 
 const BUFFER_CAP = 256 * 1024;
 
+/**
+ * Trim a PTY ring buffer to at most `cap` chars without splitting an ANSI
+ * escape sequence. Naively slicing at a fixed offset can land mid-sequence
+ * (cursor positioning, SGR colors, OSC titles, bracketed paste). On replay,
+ * xterm starts parsing a broken sequence and consumes following literal
+ * characters as parameters — letters appear where escape codes should be,
+ * tab/title styling bleeds into the buffer.
+ *
+ * Strategy: pick a cut point near `len - cap`, then advance to the next ESC
+ * (0x1b) or LF (0x0a). ESC starts a new sequence so cutting right before one
+ * is safe; LF is even safer since it never appears inside a sequence. Walks
+ * at most a few hundred bytes — cheap.
+ */
+function safeTrim(buf: string, cap: number): string {
+  if (buf.length <= cap) return buf;
+  const rough = buf.length - cap;
+  // Scan forward up to ~4 KB looking for ESC or LF.
+  const limit = Math.min(buf.length, rough + 4096);
+  for (let i = rough; i < limit; i++) {
+    const c = buf.charCodeAt(i);
+    if (c === 0x1b) return buf.slice(i);
+    if (c === 0x0a) return buf.slice(i + 1);
+  }
+  // No safe boundary nearby — fall back to the rough cut. Worst case we
+  // tear one sequence; the buffer self-corrects on the next cap-trim.
+  return buf.slice(rough);
+}
+
 export class SessionManager {
   private sessions = new Map<string, Session>();
   private groups = new Map<string, GroupInfo>();
@@ -55,14 +83,17 @@ export class SessionManager {
     const session: Session = { info, pty: proc, buffer: '' };
     this.attachBuffer(session);
 
-    proc.onExit(() => this.sessions.delete(id));
+    proc.onExit(() => {
+      const cur = this.sessions.get(id);
+      if (cur && cur.pty === proc) this.sessions.delete(id);
+    });
     this.sessions.set(id, session);
     return session;
   }
 
   private attachBuffer(session: Session): void {
     session.pty.onData((data) => {
-      session.buffer = (session.buffer + data).slice(-BUFFER_CAP);
+      session.buffer = safeTrim(session.buffer + data, BUFFER_CAP);
     });
   }
 
@@ -70,7 +101,13 @@ export class SessionManager {
   registerSession(pty: IPty, info: SessionInfo): Session {
     const session: Session = { info, pty, buffer: '' };
     this.attachBuffer(session);
-    pty.onExit(() => this.sessions.delete(info.id));
+    // Guard: identity-check before deleting. A /restart kills the old PTY and
+    // registers a new PTY at the same id; the old PTY's exit fires async and
+    // would otherwise delete the fresh entry.
+    pty.onExit(() => {
+      const cur = this.sessions.get(info.id);
+      if (cur && cur.pty === pty) this.sessions.delete(info.id);
+    });
     this.sessions.set(info.id, session);
     return session;
   }

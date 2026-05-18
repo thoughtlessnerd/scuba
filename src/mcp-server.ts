@@ -82,10 +82,14 @@ const TOOLS: ToolDef[] = [
           type: 'string',
           description: 'Telegram chatId from list_chats (for human-input routing)',
         },
-        systemPrompt: { type: 'string', description: 'Worker system prompt' },
+        systemPrompt: {
+          type: 'string',
+          description:
+            'Optional. Override the configured default worker system prompt. Pass empty/omit to use the user-configured default from scuba settings.',
+        },
         initialTask: { type: 'string', description: 'Task to type into the worker once it boots' },
       },
-      required: ['cwd', 'name', 'systemPrompt', 'initialTask'],
+      required: ['cwd', 'name', 'initialTask'],
       additionalProperties: false,
     },
     handler: async (args) => http('POST', '/api/agent/terminals', args),

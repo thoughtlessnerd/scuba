@@ -12,20 +12,11 @@ import {
   type AgentGroupRecord,
 } from './agent-store.js';
 import { PtyStateDetector, type AwaitingChoiceInfo, type StateTransitionEvent } from './pty-state.js';
+import type { Settings } from './settings.js';
 
 const DEFAULT_COLS = 120;
 const DEFAULT_ROWS = 40;
 const DEFAULT_GROUP_COLOR = '#9ece6a';
-/**
- * How long the terminal must stay in ready/idle after a turn before we count
- * it as actually finished. Claude's TUI briefly flips back to the prompt
- * between tool calls / message segments — firing turn-end on the first blink
- * sends premature "replied" screenshots. Override via TURN_END_DEBOUNCE_MS env.
- */
-const TURN_END_DEBOUNCE_MS = (() => {
-  const raw = Number(process.env.TURN_END_DEBOUNCE_MS);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 1500;
-})();
 
 export interface SpawnWorkerOptions {
   cwd: string;
@@ -72,6 +63,7 @@ export interface AgentManagerEvents {
   awaitingChoice: (terminalId: string, info: AwaitingChoiceInfo) => void;
   idle: (terminalId: string) => void;
   transition: (terminalId: string, evt: StateTransitionEvent) => void;
+  spawned: (terminalId: string) => void;
   exit: (terminalId: string, exitCode: number) => void;
 }
 
@@ -81,6 +73,7 @@ export class AgentManager extends EventEmitter {
   constructor(
     private readonly sessions: SessionManager,
     private readonly store: AgentStore,
+    private readonly settings: Settings,
   ) {
     super();
   }
@@ -163,7 +156,7 @@ export class AgentManager extends EventEmitter {
     const id = randomUUID();
     const args = [
       '--session-id', claudeSessionId,
-      '--permission-mode', 'acceptEdits',
+      '--permission-mode', this.settings.get('permissionMode'),
       '-n', opts.name,
       '--system-prompt', opts.systemPrompt,
     ];
@@ -211,7 +204,7 @@ export class AgentManager extends EventEmitter {
     const systemPrompt = opts.systemPrompt ?? '';
     const args = [
       '--session-id', claudeSessionId,
-      '--permission-mode', 'acceptEdits',
+      '--permission-mode', this.settings.get('permissionMode'),
       '-n', name,
     ];
     if (systemPrompt) args.push('--system-prompt', systemPrompt);
@@ -259,7 +252,7 @@ export class AgentManager extends EventEmitter {
     const name = opts.name ?? 'mother';
     const args = [
       '--session-id', claudeSessionId,
-      '--permission-mode', 'acceptEdits',
+      '--permission-mode', this.settings.get('permissionMode'),
       '-n', name,
       '--system-prompt', opts.systemPrompt,
     ];
@@ -291,7 +284,7 @@ export class AgentManager extends EventEmitter {
     const cwd = resolveCwd(rec.cwd);
     const args = [
       '--resume', rec.claudeSessionId,
-      '--permission-mode', 'acceptEdits',
+      '--permission-mode', this.settings.get('permissionMode'),
       '-n', rec.name,
     ];
     if (rec.systemPrompt) args.push('--system-prompt', rec.systemPrompt);
@@ -462,6 +455,34 @@ export class AgentManager extends EventEmitter {
     return true;
   }
 
+  /** Direct PTY write to any live terminal. Used by bot slash commands. */
+  typeInto(id: string, literal: string): boolean {
+    const t = this.terminals.get(id);
+    if (!t) return false;
+    t.pty.write(literal);
+    return true;
+  }
+
+  /** Kill PTY for one terminal and respawn via --resume. Preserves the DB row + claude session id. */
+  restartTerminal(id: string): boolean {
+    const t = this.terminals.get(id);
+    const rec = t?.record ?? this.store.getTerminal(id);
+    if (!rec) return false;
+    if (t) {
+      if (t.turnEndTimer) { clearTimeout(t.turnEndTimer); t.turnEndTimer = null; }
+      try { t.pty.kill(); } catch {}
+      try { t.detector.destroy(); } catch {}
+      this.terminals.delete(id);
+    }
+    try {
+      this.respawnFromRecord(rec);
+      return true;
+    } catch (err) {
+      console.error(`[agent] restartTerminal ${rec.name} failed:`, (err as Error).message);
+      return false;
+    }
+  }
+
   // ---------- introspection ----------
 
   getTerminal(id: string): AgentTerminal | undefined {
@@ -507,8 +528,14 @@ export class AgentManager extends EventEmitter {
       );
       if (term.turnEndTimer) { clearTimeout(term.turnEndTimer); term.turnEndTimer = null; }
       detector.destroy();
-      this.terminals.delete(rec.id);
-      this.emit('exit', rec.id, exitCode);
+      // Identity check: a /restart kills the old PTY and registers a new
+      // terminal at the same id. The old PTY's exit fires async and would
+      // otherwise delete the fresh entry.
+      const cur = this.terminals.get(rec.id);
+      if (cur && cur.pty === proc) {
+        this.terminals.delete(rec.id);
+        this.emit('exit', rec.id, exitCode);
+      }
     });
 
     detector.on('transition', (evt: StateTransitionEvent) => {
@@ -535,7 +562,7 @@ export class AgentManager extends EventEmitter {
               if (state !== 'ready' && state !== 'idle') return;
               term.hadInputSinceTurnEnd = false;
               this.emit('turnEnd', rec.id);
-            }, TURN_END_DEBOUNCE_MS);
+            }, this.settings.get('turnEndDebounceMs'));
           } else {
             // Workers don't post directly, so we can clear immediately.
             term.hadInputSinceTurnEnd = false;
@@ -554,6 +581,10 @@ export class AgentManager extends EventEmitter {
         if (rec.role === 'worker') this.notifyMotherOfIdle(rec.id);
       }
     });
+
+    // Defer the spawned emit so server.ts listeners see the fully-registered
+    // terminal (and can fetch it via getTerminal) without races.
+    setImmediate(() => this.emit('spawned', rec.id));
 
     return term;
   }

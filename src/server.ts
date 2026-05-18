@@ -11,8 +11,9 @@ import type { ClientMessage, ServerMessage, TelegramServerEvent } from './protoc
 import { AgentStore } from './agent-store.js';
 import { AgentManager } from './agent-manager.js';
 import { PromptRouter } from './prompt-router.js';
-import { MOTHER_SYSTEM_PROMPT } from './mother-prompt.js';
 import { prepareMotherCwd } from './mother-setup.js';
+import { Settings, type PermissionMode } from './settings.js';
+import { dispatchCommand, buildReadyMessage, telegramCommandManifest } from './bot-commands.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -29,9 +30,13 @@ export async function startServer(opts: ServerOptions): Promise<http.Server> {
   const mgr = new SessionManager();
   const telegram = new TelegramManager(process.env.TELEGRAM_BOT_TOKEN);
   await telegram.start();
+  // Register slash commands so Telegram's autocomplete + tap-to-fill in DMs
+  // omits the @botname suffix (groups always append it for disambiguation).
+  void telegram.setMyCommands(telegramCommandManifest());
 
   const store = new AgentStore();
-  const agents = new AgentManager(mgr, store);
+  const settings = new Settings(store);
+  const agents = new AgentManager(mgr, store, settings);
 
   // Pre-write mother's MCP config so bootstrap's --resume of a saved mother
   // sees the scuba MCP server. No-op if mother isn't configured yet.
@@ -41,59 +46,87 @@ export async function startServer(opts: ServerOptions): Promise<http.Server> {
     }
   }
 
+  // Mother is spawned manually via POST /api/agent/mother. If she's already in
+  // the DB, bootstrap() below will restore her PTY via --resume.
+  const motherChatId = (process.env.MOTHER_TELEGRAM_CHAT_ID ?? '').trim();
+
+  // Send a "ready" greeting + command list to the bound chat for every
+  // mother/adhoc spawn. Covers fresh spawns, bootstrap respawns, and /restart.
+  // Listener must be attached BEFORE bootstrap() since spawned is deferred via
+  // setImmediate and fires after bootstrap's await resolves.
+  //
+  // Greeting is delayed ~3.5s to outlast respawnFromRecord's exit watchdog
+  // (3s): if a --resume fails, the PTY exits and the record is deleted before
+  // we'd send the greeting. We re-check the terminal is alive at fire time.
+  const READY_GREETING_DELAY_MS = 3500;
+  agents.on('spawned', (terminalId: string) => {
+    const initial = agents.getTerminal(terminalId);
+    if (!initial) return;
+    const { role, chatId } = initial.record;
+    if (role !== 'mother' && role !== 'adhoc') return;
+    if (!chatId) return;
+    if (!telegram.enabled) return;
+    setTimeout(() => {
+      const term = agents.getTerminal(terminalId);
+      if (!term) return; // PTY died / record removed in the meantime
+      telegram
+        .sendMessage(chatId, buildReadyMessage(term))
+        .catch((err) => console.warn(`[agent] ready greeting send failed for ${term.record.name}:`, (err as Error).message));
+    }, READY_GREETING_DELAY_MS);
+  });
+
   await agents.bootstrap();
   const promptRouter = new PromptRouter(agents, telegram, store);
   promptRouter.start();
-
-  // Mother is spawned manually via POST /api/agent/mother. If she's already in
-  // the DB, bootstrap() above has restored her PTY via --resume.
-  const motherChatId = (process.env.MOTHER_TELEGRAM_CHAT_ID ?? '').trim();
   if (motherChatId) {
     const existing = store.getMother();
     if (existing) console.log(`[agent] mother restored from db (chat ${existing.chatId})`);
 
-    // Route incoming user messages on the mother chat into her input queue.
-    // Slash commands prefixed with `/` are handled by scuba directly and not forwarded.
-    telegram.on('message', (m: TelegramMessage) => {
+    // Mother-chat-only legacy commands (kept for backward compat — not in the
+    // generic command registry because they don't fit the "act on the bound
+    // terminal" model).
+    telegram.on('message', async (m: TelegramMessage) => {
       if (m.from !== 'user') return;
       if (m.chatId !== motherChatId) return;
       const text = (m.text ?? '').trim();
-      if (!text) return;
-
-      if (text === '/clear-mother') {
-        const ok = agents.typeIntoMother('/clear\r');
-        void telegram.sendMessage(motherChatId, ok ? 'mother context cleared.' : 'mother not alive.');
-        return;
-      }
       if (text === '/respawn-all') {
         const { restarted } = agents.restartAll();
         void telegram.sendMessage(motherChatId, `respawned ${restarted} terminal(s).`);
         return;
       }
-      if (text === '/status') {
-        const ts = agents.listTerminals();
-        const lines = ts.length === 0
-          ? ['no terminals.']
-          : ts.map((t) => `• ${t.record.name} (${t.record.role}) — ${t.detector.getState()}`);
-        void telegram.sendMessage(motherChatId, lines.join('\n'));
+      if (text === '/clear-mother') {
+        const ok = agents.typeIntoMother('/clear\r');
+        void telegram.sendMessage(motherChatId, ok ? 'mother context cleared.' : 'mother not alive.');
         return;
       }
-
-      const enqueued = agents.enqueueForMother(text);
-      if (!enqueued) console.warn('[agent] mother chat got message but mother is not alive');
     });
   } else {
     console.log('[agent] MOTHER_TELEGRAM_CHAT_ID not set — mother disabled');
   }
 
-  // Adhoc claude terminals are bound to a chat at spawn time. Any user message
-  // arriving in that chat (other than mother's chat, which is sacred) is
-  // enqueued into every adhoc terminal bound to it.
-  telegram.on('message', (m: TelegramMessage) => {
+  // Generic routing for every user message. Slash commands defined in the
+  // bot-commands registry act on the terminal bound to the chat (mother or
+  // adhoc). Non-command text goes into the bound terminal's input queue.
+  telegram.on('message', async (m: TelegramMessage) => {
     if (m.from !== 'user') return;
-    if (motherChatId && m.chatId === motherChatId) return;
     const text = (m.text ?? '').trim();
     if (!text) return;
+
+    // Legacy mother-only commands above were handled by a separate listener;
+    // skip re-handling them here.
+    if (m.chatId === motherChatId && (text === '/respawn-all' || text === '/clear-mother')) return;
+
+    if (text.startsWith('/')) {
+      const handled = await dispatchCommand(text, m.chatId, motherChatId || null, agents, telegram);
+      if (handled) return;
+      // Unknown command — fall through, treat as input.
+    }
+
+    if (motherChatId && m.chatId === motherChatId) {
+      const enqueued = agents.enqueueForMother(text);
+      if (!enqueued) console.warn('[agent] mother chat got message but mother is not alive');
+      return;
+    }
     agents.enqueueForAdhocChat(m.chatId, text);
   });
 
@@ -320,13 +353,16 @@ export async function startServer(opts: ServerOptions): Promise<http.Server> {
       const { cwd, name, groupId, chatId, systemPrompt, initialTask } = req.body ?? {};
       if (typeof cwd !== 'string' || !cwd.trim()) throw new Error('cwd required');
       if (typeof name !== 'string' || !name.trim()) throw new Error('name required');
-      if (typeof systemPrompt !== 'string') throw new Error('systemPrompt required');
+      const effectivePrompt =
+        typeof systemPrompt === 'string' && systemPrompt.trim().length > 0
+          ? systemPrompt
+          : settings.get('workerSystemPrompt');
       const t = agents.spawnWorker({
         cwd: cwd.trim(),
         name: name.trim(),
         groupId: groupId ?? null,
         chatId: chatId ?? null,
-        systemPrompt,
+        systemPrompt: effectivePrompt,
         initialTask,
       });
       res.json({ ...t.record, state: t.detector.getState() });
@@ -383,7 +419,7 @@ export async function startServer(opts: ServerOptions): Promise<http.Server> {
       const t = agents.spawnMother({
         cwd,
         chatId: motherChatId,
-        systemPrompt: MOTHER_SYSTEM_PROMPT,
+        systemPrompt: settings.get('motherSystemPrompt'),
       });
       res.json({ ...t.record, state: t.detector.getState() });
     } catch (err) {
@@ -403,8 +439,33 @@ export async function startServer(opts: ServerOptions): Promise<http.Server> {
         cwd: cwd.trim(),
         chatId: chatId.trim(),
         name: typeof name === 'string' ? name : undefined,
+        systemPrompt: settings.get('adhocSystemPrompt'),
       });
       res.json({ ...t.record, state: t.detector.getState() });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/settings', (_req, res) => {
+    res.json({ values: settings.values(), defaults: settings.defaults });
+  });
+
+  app.patch('/api/settings', (req, res) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const patch: Parameters<Settings['update']>[0] = {};
+      if (typeof body.motherSystemPrompt === 'string') patch.motherSystemPrompt = body.motherSystemPrompt;
+      if (typeof body.workerSystemPrompt === 'string') patch.workerSystemPrompt = body.workerSystemPrompt;
+      if (typeof body.adhocSystemPrompt === 'string') patch.adhocSystemPrompt = body.adhocSystemPrompt;
+      if (body.permissionMode === 'acceptEdits' || body.permissionMode === 'bypassPermissions') {
+        patch.permissionMode = body.permissionMode as PermissionMode;
+      }
+      if (body.turnEndDebounceMs !== undefined) {
+        patch.turnEndDebounceMs = Number(body.turnEndDebounceMs);
+      }
+      const next = settings.update(patch);
+      res.json({ values: next, defaults: settings.defaults });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }

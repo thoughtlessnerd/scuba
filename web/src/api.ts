@@ -218,6 +218,40 @@ export async function listBoundChatIds(): Promise<string[]> {
   return chatIds;
 }
 
+export type PermissionMode = 'acceptEdits' | 'bypassPermissions';
+
+export interface SettingsValues {
+  motherSystemPrompt: string;
+  workerSystemPrompt: string;
+  adhocSystemPrompt: string;
+  permissionMode: PermissionMode;
+  turnEndDebounceMs: number;
+}
+
+export interface SettingsResponse {
+  values: SettingsValues;
+  defaults: SettingsValues;
+}
+
+export async function getSettings(): Promise<SettingsResponse> {
+  const res = await fetch('/api/settings');
+  if (!res.ok) throw new Error(`getSettings: ${res.status}`);
+  return res.json();
+}
+
+export async function updateSettings(patch: Partial<SettingsValues>): Promise<SettingsResponse> {
+  const res = await fetch('/api/settings', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const { error } = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(error || 'Failed to update settings');
+  }
+  return res.json();
+}
+
 export async function spawnAdhocClaude(input: {
   cwd: string;
   chatId: string;

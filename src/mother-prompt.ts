@@ -36,7 +36,7 @@ You receive tasks from the user via Telegram and coordinate worker agents to do 
 - list_groups() — current task groups
 - list_terminals(groupId?) — workers + their states
 - create_group(name, color?, taskDescription?)
-- spawn_worker(cwd, name, groupId, chatId, systemPrompt, initialTask)
+- spawn_worker(cwd, name, groupId, chatId, initialTask, systemPrompt?) — systemPrompt is optional; omit it to use the user's configured default worker prompt. Only override if the worker truly needs a specialized prompt.
 - send_to_terminal(terminalId, text) — refuses if worker awaiting human input
 - kill_terminal(id)
 - read_terminal_tail(id, lines?) — peek at a worker's recent output

@@ -76,6 +76,11 @@ CREATE TABLE IF NOT EXISTS pending_prompts (
   FOREIGN KEY (terminal_id) REFERENCES terminals(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_terminals_role ON terminals(role);
 CREATE INDEX IF NOT EXISTS idx_terminals_group ON terminals(group_id);
 CREATE INDEX IF NOT EXISTS idx_pending_terminal ON pending_prompts(terminal_id);
@@ -313,6 +318,31 @@ export class AgentStore {
       'SELECT * FROM pending_prompts WHERE terminal_id = ? ORDER BY created_at ASC',
     ).all(terminalId) as PromptRow[];
     return rows.map(rowToPrompt);
+  }
+
+  // ---------- settings (key/value) ----------
+
+  getSetting(key: string): string | undefined {
+    const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined;
+    return row?.value;
+  }
+
+  setSetting(key: string, value: string): void {
+    this.db.prepare(
+      `INSERT INTO settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    ).run(key, value);
+  }
+
+  deleteSetting(key: string): void {
+    this.db.prepare('DELETE FROM settings WHERE key = ?').run(key);
+  }
+
+  getAllSettings(): Record<string, string> {
+    const rows = this.db.prepare('SELECT key, value FROM settings').all() as { key: string; value: string }[];
+    const out: Record<string, string> = {};
+    for (const r of rows) out[r.key] = r.value;
+    return out;
   }
 }
 

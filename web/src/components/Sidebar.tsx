@@ -2,9 +2,10 @@ import { useEffect, useMemo, useState } from 'react';
 import type { GroupInfo, GroupType, SessionInfo } from '../types';
 import { EditableLabel } from './EditableLabel';
 import { ColorSwatch } from './ColorSwatch';
-import { EyeIcon, EyeOffIcon, ChevronIcon, PlusIcon } from './Icons';
+import { EyeIcon, EyeOffIcon, ChevronIcon, PlusIcon, SettingsIcon } from './Icons';
 import { sessionLabel } from '../labels';
 import { NewClaudeModal } from './NewClaudeModal';
+import { SettingsModal } from './SettingsModal';
 import * as api from '../api';
 
 interface Props {
@@ -53,6 +54,7 @@ export function Sidebar(props: Props) {
   const [busy, setBusy] = useState(false);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [showClaudeModal, setShowClaudeModal] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   const sessionsByGroup = useMemo(() => {
     const map = new Map<string, SessionInfo[]>();
@@ -89,7 +91,17 @@ export function Sidebar(props: Props) {
         <button className="ghost-btn" onClick={() => onNewGroup('tabs')} title="New group">
           <PlusIcon /> Group
         </button>
+        <button
+          className="icon-btn"
+          onClick={() => setShowSettings(true)}
+          title="Settings"
+          aria-label="Open settings"
+        >
+          <SettingsIcon />
+        </button>
       </header>
+
+      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
 
       <form className="spawn-form" onSubmit={submit}>
         <input
