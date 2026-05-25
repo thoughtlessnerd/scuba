@@ -102,9 +102,21 @@ export class PromptRouter {
       return;
     }
 
-    // Skip if we already have a pending prompt for this terminal (don't double-ask).
+    // If a pending row already exists: same question → wait for the user to
+    // answer it. Different question → the old prompt is obsolete (claude only
+    // has one live prompt at a time), so clear it and post the new one.
+    // Without this, an unanswered prompt would permanently block the terminal
+    // from posting any future prompts.
     const existing = this.store.listPendingPromptsForTerminal(terminalId);
-    if (existing.length > 0) return;
+    if (existing.length > 0) {
+      const prev = existing[0];
+      const prevHash = hashPendingPrompt(prev.question, prev.options);
+      if (prevHash === hash) return;
+      try {
+        await this.telegram.editMessageReplyMarkup(prev.chatId, prev.telegramMessageId, null);
+      } catch {}
+      this.store.deletePendingPrompt(prev.id);
+    }
 
     this.inFlight.add(terminalId);
     try {

@@ -9,36 +9,110 @@ phone with inline-keyboard buttons and replies are mirrored back.
 Every terminal is a real PTY on the host, so `vim`, `htop`, tab completion,
 arrow-key history, Ctrl-C, all work as expected.
 
-## Install
+## Setup
 
-scuba isn't on the public npm registry — install from source:
+### Prerequisites
+
+- **Node.js ≥ 20** (`node -v`). On macOS: `brew install node`.
+- **Claude Code CLI** on your `PATH` (`claude --version`). Install via
+  [claude.ai/code](https://claude.ai/code) and run `claude` once to log in —
+  scuba spawns it as the shell for every agent terminal.
+- **Build tools** for `node-pty` if no prebuilt binary is available for your
+  Node version: Xcode CLT (`xcode-select --install`) on macOS, or `build-essential`
+  on Linux.
+
+### 1. Create a Telegram bot
+
+1. Open [@BotFather](https://t.me/BotFather) in Telegram → `/newbot` → follow
+   the prompts. Save the **HTTP API token** — this is `TELEGRAM_BOT_TOKEN`.
+2. (Optional, but recommended for group chats) `/setprivacy` → pick your bot →
+   **Disable**. Without this, the bot only sees commands in groups, not regular
+   messages.
+3. DM your new bot anything (e.g. "hi") so Telegram creates the chat.
+
+### 2. Find your chat ID
+
+`MOTHER_TELEGRAM_CHAT_ID` is the chat where mother (the orchestrator) listens
+and replies. The easiest way to get it:
+
+1. Open [@userinfobot](https://t.me/userinfobot) → it replies with your numeric
+   user ID. That's your DM chat ID with any bot.
+2. Alternatively, after DMing your bot, fetch:
+   `curl "https://api.telegram.org/bot<TOKEN>/getUpdates"` and look for
+   `"chat":{"id":…}`.
+
+For a group chat ID, add the bot to the group, send a message, then call
+`getUpdates` — group IDs are negative (e.g. `-1003915835945`).
+
+### 3. Install scuba
+
+scuba isn't published to npm — install from source:
 
 ```bash
-git clone github.com/thoughtlessnerd/scuba scuba
+git clone https://github.com/thoughtlessnerd/scuba.git
 cd scuba
 npm install
 npm run build
-npm i -g .          # installs the `scuba` binary globally
-scuba setup         # interactive prompt for required env vars (~/.scuba/.env)
-scuba start         # opens http://127.0.0.1:4242 in your browser
+npm i -g .          # installs `scuba` globally
 ```
 
-`scuba setup` asks for:
-- `TELEGRAM_BOT_TOKEN` (required) — from [@BotFather](https://t.me/BotFather)
-- `MOTHER_TELEGRAM_CHAT_ID` (required) — the chat mother answers in (your DM with the bot)
-- `MOTHER_CWD` (optional) — default `~/.scuba/mother-home`
-- `TURN_END_DEBOUNCE_MS` (optional) — default `1500`
+If `npm i -g` fails with EACCES, either fix your npm prefix
+(`npm config set prefix ~/.npm-global` and add `~/.npm-global/bin` to PATH) or
+use `sudo npm i -g .`.
 
-Re-run `scuba setup` any time to update values; current values are shown as defaults.
-
-To upgrade after pulling new code:
+### 4. Configure and start
 
 ```bash
+scuba setup         # interactive — writes ~/.scuba/.env (0600)
+scuba start         # opens http://127.0.0.1:4242
+```
+
+`scuba setup` prompts for:
+
+| Var | Required | Default | Notes |
+|---|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | yes | — | from @BotFather |
+| `MOTHER_TELEGRAM_CHAT_ID` | yes | — | your DM chat ID with the bot |
+| `MOTHER_CWD` | no | `~/.scuba/mother-home` | where mother's `.mcp.json` lives. Don't set to `~` or `$HOME` — scuba will refuse |
+| `TURN_END_DEBOUNCE_MS` | no | `1500` | how long mother/adhoc must stay idle before scuba posts a "replied" screenshot |
+
+Re-run `scuba setup` any time — current values are shown as defaults; press
+Enter to keep each.
+
+### 5. Smoke test
+
+With `scuba start` running:
+
+1. Open `http://127.0.0.1:4242` — you should see the workspace + an empty
+   sidebar + the Telegram phone panel on the right.
+2. The Telegram panel header should show your bot's username. If not, check
+   `scuba start` logs for token errors.
+3. Click **Spawn mother** in the sidebar header. A new terminal appears running
+   `claude`. Within ~5 seconds you'll get a "mother ready" greeting in your DM.
+4. DM the bot something like `list the files in /tmp` — mother should reply
+   with a screenshot of her terminal.
+
+If mother prompts you to approve the **scuba MCP server**, tap **Yes** in the
+inline keyboard — that's a one-time consent for her to use scuba's
+orchestration tools.
+
+### Upgrading
+
+```bash
+cd scuba
 git pull
+npm install
 npm run build && npm i -g .
 ```
 
-To uninstall: `npm uninstall -g scuba`.
+Then restart: kill the running `scuba start` and re-run it.
+
+### Uninstall
+
+```bash
+npm uninstall -g scuba
+rm -rf ~/.scuba           # only if you also want to wipe state (chats, agents, settings)
+```
 
 ---
 
@@ -62,11 +136,15 @@ node dist/cli.js start
 
 ```
 scuba setup
-scuba start [--host 127.0.0.1] [--port 4242] [--no-open] [--dev]
+scuba start [--host 127.0.0.1] [--port 4242] [--no-open]
+            [--no-keep-awake] [--dev]
 ```
 
 - `--host`, `--port` — bind address.
 - `--no-open` — don't auto-open the browser.
+- `--no-keep-awake` — on macOS, opt out of the `caffeinate` child that prevents
+  idle/display/system sleep while scuba runs. Default is on (no-op on Linux/Windows).
+  Lid-close sleep isn't prevented — see HANDOVER.md gotcha #21.
 - `--dev` — serves API only; expects you to run the Vite dev UI on `:5173` yourself.
 
 ---
@@ -139,6 +217,23 @@ TURN_END_DEBOUNCE_MS=                # default: 1500 — how long mother/adhoc m
 `scuba start` loads env from (in order, first hit wins): `./.env` in your cwd,
 `~/.scuba/.env`, then the package root's `.env`. It refuses to start if either
 required var is missing — it prints a "run `scuba setup`" hint and exits.
+
+### Troubleshooting
+
+- **"TELEGRAM_BOT_TOKEN missing" on start** — run `scuba setup`, or check that
+  `~/.scuba/.env` exists and is readable.
+- **Mother never greets you** — `claude` may not be on PATH for the spawned
+  PTY. Test with `which claude` in your normal shell; if it's there but
+  scuba can't find it, your PATH may be set in `.zshrc` (interactive) instead
+  of `.zshenv` (non-interactive). Move the relevant `export PATH=…` to `.zshenv`.
+- **Bot sees `/cmd` in groups but ignores plain text** — privacy mode is still
+  on; revisit BotFather `/setprivacy`.
+- **node-pty install fails** — install build tools (see Prerequisites) and run
+  `npm rebuild node-pty`.
+- **Permission prompt stuck — no buttons appearing in Telegram** — there may
+  be a stale pending row blocking new prompts. Inspect with
+  `sqlite3 ~/.scuba/agents.db 'SELECT * FROM pending_prompts;'` and delete
+  rows whose Telegram message you already dismissed.
 
 ---
 
